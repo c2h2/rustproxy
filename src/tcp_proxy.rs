@@ -1,34 +1,81 @@
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info};
+use tracing::{error, info, debug};
+use crate::connection_cache::ConnectionCache;
 
 pub struct TcpProxy {
     bind_addr: String,
     target_addr: String,
+    cache: ConnectionCache,
 }
 
 impl TcpProxy {
-    pub fn new(bind_addr: &str, target_addr: &str) -> Self {
+    pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
             target_addr: target_addr.to_string(),
+            cache: ConnectionCache::new(cache_size_bytes),
         }
     }
 
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.bind_addr).await?;
-        info!("TCP proxy listening on {} -> {}", self.bind_addr, self.target_addr);
+        let (current_cache, max_cache) = self.cache.get_cache_stats().await;
+        info!("TCP proxy listening on {} -> {} (cache: {}/{}KB)", 
+              self.bind_addr, self.target_addr, current_cache / 1024, max_cache / 1024);
 
         loop {
             let (inbound, client_addr) = listener.accept().await?;
             let target_addr = self.target_addr.clone();
+            let cache = self.cache.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(inbound, client_addr, target_addr).await {
+                if let Err(e) = Self::handle_connection_with_cache(inbound, client_addr, target_addr, cache).await {
                     error!("Error handling connection from {}: {}", client_addr, e);
                 }
             });
         }
+    }
+
+    pub async fn handle_connection_with_cache(
+        mut inbound: TcpStream,
+        client_addr: SocketAddr,
+        target_addr: String,
+        cache: ConnectionCache,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Try to get a cached connection first
+        let mut outbound = match cache.get_connection(&target_addr).await {
+            Some(conn) => {
+                debug!("Using cached connection for {} -> {}", client_addr, target_addr);
+                conn
+            }
+            None => {
+                debug!("Creating new connection for {} -> {}", client_addr, target_addr);
+                TcpStream::connect(&target_addr).await?
+            }
+        };
+
+        info!("Proxying connection from {} to {}", client_addr, target_addr);
+
+        let (mut ri, mut wi) = inbound.split();
+        let (mut ro, mut wo) = outbound.split();
+
+        let client_to_server = tokio::io::copy(&mut ri, &mut wo);
+        let server_to_client = tokio::io::copy(&mut ro, &mut wi);
+
+        match tokio::try_join!(client_to_server, server_to_client) {
+            Ok((bytes_to_server, bytes_to_client)) => {
+                info!(
+                    "Connection {} closed. Transferred {} bytes to server, {} bytes to client",
+                    client_addr, bytes_to_server, bytes_to_client
+                );
+            }
+            Err(e) => {
+                error!("Error in bidirectional copy for {}: {}", client_addr, e);
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn handle_connection(
@@ -78,7 +125,7 @@ mod tests {
         
         tokio::spawn(mock_server.echo_server());
 
-        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string());
+        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 

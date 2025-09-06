@@ -103,7 +103,7 @@ async fn test_http_proxy_basic() {
     
     tokio::spawn(target_server.http_echo_server());
 
-    let proxy = HttpProxy::new("127.0.0.1:0", "127.0.0.1:8080");
+    let proxy = HttpProxy::new("127.0.0.1:0", "127.0.0.1:8080", 128 * 1024);
     let proxy_handle = tokio::spawn(async move {
         let _ = proxy.start().await;
     });

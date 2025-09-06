@@ -2,37 +2,46 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use tracing::{error, info};
+use tracing::{error, info, debug};
+use crate::connection_cache::ConnectionCache;
 
 pub struct HttpProxy {
     bind_addr: String,
     target_addr: String,
+    cache: ConnectionCache,
 }
 
 impl HttpProxy {
-    pub fn new(bind_addr: &str, target_addr: &str) -> Self {
+    pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
             target_addr: target_addr.to_string(),
+            cache: ConnectionCache::new(cache_size_bytes),
         }
     }
 
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let addr: SocketAddr = self.bind_addr.parse()?;
         let target = self.target_addr.clone();
+        let cache = self.cache.clone();
+        
+        let (current_cache, max_cache) = self.cache.get_cache_stats().await;
+        info!("HTTP proxy listening on {} -> {} (cache: {}/{}KB)", 
+              self.bind_addr, self.target_addr, current_cache / 1024, max_cache / 1024);
         
         let make_svc = make_service_fn(move |_conn| {
             let target = target.clone();
+            let cache = cache.clone();
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
                     let target = target.clone();
-                    proxy_handler(req, target)
+                    let cache = cache.clone();
+                    proxy_handler_with_cache(req, target, cache)
                 }))
             }
         });
 
         let server = Server::bind(&addr).serve(make_svc);
-        info!("HTTP proxy listening on {} -> {}", self.bind_addr, self.target_addr);
 
         if let Err(e) = server.await {
             error!("HTTP server error: {}", e);
@@ -40,6 +49,14 @@ impl HttpProxy {
 
         Ok(())
     }
+}
+
+async fn proxy_handler_with_cache(mut req: Request<Body>, target_addr: String, _cache: ConnectionCache) -> Result<Response<Body>, Infallible> {
+    // Note: HTTP proxy connection caching is more complex due to hyper's Client handling
+    // For now, we'll use hyper's built-in connection pooling, but the cache parameter
+    // is available for future advanced implementations
+    debug!("HTTP request with cache support (using hyper's built-in pooling)");
+    proxy_handler(req, target_addr).await
 }
 
 async fn proxy_handler(mut req: Request<Body>, target_addr: String) -> Result<Response<Body>, Infallible> {
@@ -93,7 +110,7 @@ mod tests {
         
         tokio::spawn(mock_http_server.http_server());
 
-        let proxy = HttpProxy::new("127.0.0.1:0", &format!("127.0.0.1:{}", mock_addr.port()));
+        let proxy = HttpProxy::new("127.0.0.1:0", &format!("127.0.0.1:{}", mock_addr.port()), 128 * 1024);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let target = format!("127.0.0.1:{}", mock_addr.port());
         let make_svc = make_service_fn(move |_conn| {
