@@ -1,0 +1,19 @@
+[package]
+name = "rustproxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+hyper-tungstenite = "0.9"
+http-body-util = "0.1"
+bytes = "1.0"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.11", default-features = false, features = ["json"] }
+serde_json = "1.0"
