@@ -28,15 +28,15 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
 ### Options
 
 - `--listen <address:port>` - Address to listen on
-- `--target <address:port>` - Address to proxy requests to (required for tcp/http modes)
+- `--target <address:port>` - Address to proxy requests to (required for tcp mode only)
 - `--mode <tcp|http|socks5>` - Proxy mode
-- `--cache-size <size>` - Connection cache size (default: 128KB)
-  - Examples: `0`, `none`, `128kb`, `1mb`, `8mb`
+- `--cache-size <size>` - Connection cache size (default: 256KB)
+  - Examples: `0`, `none`, `256kb`, `1mb`, `8mb`
 - `--socks5-auth <user:pass>` - SOCKS5 authentication credentials (optional)
 
 ### Examples
 
-**TCP Proxy with default caching (128KB):**
+**TCP Proxy with default caching (256KB):**
 ```bash
 rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp
 ```
@@ -51,9 +51,9 @@ rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache
 rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 0
 ```
 
-**HTTP Proxy:**
+**HTTP Proxy (local server, no forwarding):**
 ```bash
-rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode http
+rustproxy --listen 127.0.0.1:8080 --mode http
 ```
 
 **SOCKS5 Proxy (no authentication):**

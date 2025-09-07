@@ -19,15 +19,15 @@ fn print_usage() {
     println!("Usage: rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [--cache-size <size>] [--socks5-auth <user:pass>]");
     println!("Options:");
     println!("  --listen <address:port>     Address to listen on");
-    println!("  --target <address:port>     Address to proxy to (required for tcp/http modes)");
+    println!("  --target <address:port>     Address to proxy to (required for tcp mode only)");
     println!("  --mode <tcp|http|socks5>    Proxy mode");
-    println!("  --cache-size <size>         Connection cache size (default: 128kb)");
-    println!("                              Examples: 0, none, 128kb, 1mb, 8mb");
+    println!("  --cache-size <size>         Connection cache size (default: 256kb)");
+    println!("                              Examples: 0, none, 256kb, 1mb, 8mb");
     println!("  --socks5-auth <user:pass>   SOCKS5 authentication (optional)");
     println!();
     println!("Examples:");
-    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp");
-    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode http --cache-size 1mb");
+    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 1mb");
+    println!("  rustproxy --listen 127.0.0.1:8080 --mode http");
     println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5");
     println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5 --socks5-auth user:password");
 }
@@ -100,15 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen = listen_addr.ok_or("Missing --listen parameter")?;
     let mode = mode.ok_or("Missing --mode parameter")?;
     
-    // Target is only required for tcp and http modes
-    let target = if mode == "socks5" {
-        None
+    // Target is only required for tcp mode
+    let target = if mode == "tcp" {
+        Some(target_addr.ok_or("Missing --target parameter for tcp mode")?)
     } else {
-        Some(target_addr.ok_or("Missing --target parameter for tcp/http mode")?)
+        target_addr
     };
 
-    // Default to 128KB cache if not specified
-    let cache_size_str = cache_size.unwrap_or_else(|| "128kb".to_string());
+    // Default to 256KB cache if not specified
+    let cache_size_str = cache_size.unwrap_or_else(|| "256kb".to_string());
     let cache_size_bytes = match parse_cache_size(&cache_size_str) {
         Ok(size) => size,
         Err(e) => {
@@ -122,11 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Validate no self-connection for tcp/http modes
-    if let Some(ref target_addr) = target {
-        if let Err(e) = validate_no_self_connection(&listen, target_addr) {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+    // Validate no self-connection for tcp mode
+    if mode == "tcp" {
+        if let Some(ref target_addr) = target {
+            if let Err(e) = validate_no_self_connection(&listen, target_addr) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -142,9 +144,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "socks5" => {
             info!("Starting SOCKS5 proxy on {} (cache: {})", listen, cache_display);
         }
-        _ => {
+        "tcp" => {
             info!("Starting {} proxy: {} -> {} (cache: {})", mode, listen, target.as_ref().unwrap(), cache_display);
         }
+        "http" => {
+            info!("Starting {} proxy on {} (cache: {})", mode, listen, cache_display);
+        }
+        _ => unreachable!(),
     }
 
     match mode.as_str() {
@@ -157,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "http" => {
-            let target = target.unwrap();
+            let target = target.unwrap_or_else(|| "".to_string());
             let proxy = HttpProxy::new(&listen, &target, cache_size_bytes);
             if let Err(e) = proxy.start().await {
                 error!("HTTP proxy error: {}", e);
