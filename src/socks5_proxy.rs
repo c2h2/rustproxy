@@ -18,14 +18,8 @@ const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 
 const SOCKS5_REP_SUCCESS: u8 = 0x00;
-const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
-const SOCKS5_REP_CONN_NOT_ALLOWED: u8 = 0x02;
-const SOCKS5_REP_NET_UNREACHABLE: u8 = 0x03;
 const SOCKS5_REP_HOST_UNREACHABLE: u8 = 0x04;
-const SOCKS5_REP_CONN_REFUSED: u8 = 0x05;
-const SOCKS5_REP_TTL_EXPIRED: u8 = 0x06;
 const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
-const SOCKS5_REP_ADDR_NOT_SUPPORTED: u8 = 0x08;
 
 #[derive(Clone)]
 pub struct Socks5Proxy {
@@ -39,7 +33,6 @@ pub struct Socks5Proxy {
 #[derive(Debug)]
 struct Socks5Request {
     cmd: u8,
-    atyp: u8,
     addr: String,
     port: u16,
 }
@@ -251,7 +244,7 @@ impl Socks5Proxy {
             }
         };
 
-        Ok(Socks5Request { cmd, atyp, addr, port })
+        Ok(Socks5Request { cmd, addr, port })
     }
 
     async fn handle_connect_command(&self, mut client_stream: TcpStream, client_addr: SocketAddr, request: Socks5Request) -> Result<(), Box<dyn std::error::Error>> {

@@ -78,34 +78,6 @@ impl TcpProxy {
         Ok(())
     }
 
-    pub async fn handle_connection(
-        mut inbound: TcpStream,
-        client_addr: SocketAddr,
-        target_addr: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut outbound = TcpStream::connect(&target_addr).await?;
-        info!("Proxying connection from {} to {}", client_addr, target_addr);
-
-        let (mut ri, mut wi) = inbound.split();
-        let (mut ro, mut wo) = outbound.split();
-
-        let client_to_server = tokio::io::copy(&mut ri, &mut wo);
-        let server_to_client = tokio::io::copy(&mut ro, &mut wi);
-
-        match tokio::try_join!(client_to_server, server_to_client) {
-            Ok((bytes_to_server, bytes_to_client)) => {
-                info!(
-                    "Connection {} closed. Transferred {} bytes to server, {} bytes to client",
-                    client_addr, bytes_to_server, bytes_to_client
-                );
-            }
-            Err(e) => {
-                error!("Error in bidirectional copy for {}: {}", client_addr, e);
-            }
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -125,7 +97,7 @@ mod tests {
         
         tokio::spawn(mock_server.echo_server());
 
-        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024);
+        let _proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -133,7 +105,8 @@ mod tests {
             while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
                 let target_addr = target_addr.to_string();
                 tokio::spawn(async move {
-                    let _ = TcpProxy::handle_connection(inbound, client_addr, target_addr).await;
+                    let cache = ConnectionCache::new(128 * 1024);
+                    let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache).await;
                 });
             }
         });
@@ -167,7 +140,8 @@ mod tests {
             while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
                 let target_addr = target_addr.to_string();
                 tokio::spawn(async move {
-                    let _ = TcpProxy::handle_connection(inbound, client_addr, target_addr).await;
+                    let cache = ConnectionCache::new(128 * 1024);
+                    let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache).await;
                 });
             }
         });
@@ -213,7 +187,8 @@ mod tests {
             while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
                 let target_addr = target_addr.to_string();
                 tokio::spawn(async move {
-                    let _ = TcpProxy::handle_connection(inbound, client_addr, target_addr).await;
+                    let cache = ConnectionCache::new(128 * 1024);
+                    let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache).await;
                 });
             }
         });

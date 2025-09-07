@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tracing::info;
 
 pub struct MockTcpServer {
@@ -41,19 +41,6 @@ impl MockTcpServer {
         }
     }
 
-    pub async fn fixed_response_server(self, response: String) {
-        while let Ok((mut socket, addr)) = self.listener.accept().await {
-            info!("Mock server accepted connection from {}", addr);
-            let response = response.clone();
-            
-            tokio::spawn(async move {
-                let mut buf = [0; 1024];
-                if socket.read(&mut buf).await.is_ok() {
-                    let _ = socket.write_all(response.as_bytes()).await;
-                }
-            });
-        }
-    }
 
     pub async fn http_server(self) {
         while let Ok((mut socket, addr)) = self.listener.accept().await {

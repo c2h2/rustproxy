@@ -51,7 +51,7 @@ impl HttpProxy {
     }
 }
 
-async fn proxy_handler_with_cache(mut req: Request<Body>, target_addr: String, _cache: ConnectionCache) -> Result<Response<Body>, Infallible> {
+async fn proxy_handler_with_cache(req: Request<Body>, target_addr: String, _cache: ConnectionCache) -> Result<Response<Body>, Infallible> {
     // Note: HTTP proxy connection caching is more complex due to hyper's Client handling
     // For now, we'll use hyper's built-in connection pooling, but the cache parameter
     // is available for future advanced implementations
@@ -110,7 +110,7 @@ mod tests {
         
         tokio::spawn(mock_http_server.http_server());
 
-        let proxy = HttpProxy::new("127.0.0.1:0", &format!("127.0.0.1:{}", mock_addr.port()), 128 * 1024);
+        let _proxy = HttpProxy::new("127.0.0.1:0", &format!("127.0.0.1:{}", mock_addr.port()), 128 * 1024);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let target = format!("127.0.0.1:{}", mock_addr.port());
         let make_svc = make_service_fn(move |_conn| {
@@ -124,7 +124,7 @@ mod tests {
         });
 
         let server = Server::bind(&addr).serve(make_svc);
-        let proxy_addr = server.local_addr();
+        let _proxy_addr = server.local_addr();
         
         tokio::spawn(async move {
             let _ = server.await;

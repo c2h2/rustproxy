@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[derive(Clone)]
 pub struct ConnectionCache {
@@ -36,6 +36,8 @@ impl ConnectionCache {
         None
     }
 
+
+    #[allow(dead_code)]
     pub async fn store_connection(&self, target: &str, connection: TcpStream) {
         if self.max_size_bytes == 0 {
             debug!("Connection caching disabled");
@@ -44,7 +46,7 @@ impl ConnectionCache {
 
         let mut current_size = self.current_size_bytes.lock().await;
         if *current_size + 8192 > self.max_size_bytes {
-            warn!("Connection cache full ({} bytes), not storing connection", *current_size);
+            debug!("Connection cache full ({} bytes), not storing connection", *current_size);
             return; // Cache full
         }
 
@@ -60,9 +62,6 @@ impl ConnectionCache {
         (current_size, self.max_size_bytes)
     }
 
-    pub fn cache_size_kb(&self) -> usize {
-        self.max_size_bytes / 1024
-    }
 }
 
 pub fn parse_cache_size(cache_size_str: &str) -> Result<usize, String> {
@@ -120,7 +119,7 @@ mod tests {
         
         // Start a simple echo server
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok((stream, _)) = listener.accept().await {
                 let mut buf = [0; 1024];
                 if let Ok(_) = stream.try_read(&mut buf) {
                     // Just close the connection
