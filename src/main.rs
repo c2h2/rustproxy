@@ -4,6 +4,7 @@ use tracing::{error, info};
 
 mod tcp_proxy;
 mod http_proxy;
+mod socks5_proxy;
 mod connection_cache;
 
 #[cfg(test)]
@@ -11,21 +12,24 @@ mod test_utils;
 
 use tcp_proxy::TcpProxy;
 use http_proxy::HttpProxy;
+use socks5_proxy::Socks5Proxy;
 use connection_cache::parse_cache_size;
 
 fn print_usage() {
-    println!("Usage: rustproxy --listen <address:port> --target <address:port> --mode <tcp|http> [--cache-size <size>]");
+    println!("Usage: rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [--cache-size <size>] [--socks5-auth <user:pass>]");
     println!("Options:");
-    println!("  --listen <address:port>  Address to listen on");
-    println!("  --target <address:port>  Address to proxy to");
-    println!("  --mode <tcp|http>        Proxy mode (tcp or http)");
-    println!("  --cache-size <size>      Connection cache size (default: 128kb)");
-    println!("                           Examples: 0, none, 128kb, 1mb, 8mb");
+    println!("  --listen <address:port>     Address to listen on");
+    println!("  --target <address:port>     Address to proxy to (required for tcp/http modes)");
+    println!("  --mode <tcp|http|socks5>    Proxy mode");
+    println!("  --cache-size <size>         Connection cache size (default: 128kb)");
+    println!("                              Examples: 0, none, 128kb, 1mb, 8mb");
+    println!("  --socks5-auth <user:pass>   SOCKS5 authentication (optional)");
     println!();
     println!("Examples:");
     println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp");
-    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 1mb");
-    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 0");
+    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode http --cache-size 1mb");
+    println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5");
+    println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5 --socks5-auth user:password");
 }
 
 fn validate_no_self_connection(listen: &str, target: &str) -> Result<(), String> {
@@ -47,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
     
-    if args.len() < 7 || args.len() > 9 {
+    if args.len() < 5 || args.len() > 11 {
         print_usage();
         std::process::exit(1);
     }
@@ -56,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut target_addr = None;
     let mut mode = None;
     let mut cache_size = None;
+    let mut socks5_auth = None;
 
     for i in (1..args.len()).step_by(2) {
         match args[i].as_str() {
@@ -79,6 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cache_size = Some(args[i + 1].clone());
                 }
             }
+            "--socks5-auth" => {
+                if i + 1 < args.len() {
+                    socks5_auth = Some(args[i + 1].clone());
+                }
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 print_usage();
@@ -88,8 +98,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listen = listen_addr.ok_or("Missing --listen parameter")?;
-    let target = target_addr.ok_or("Missing --target parameter")?;
     let mode = mode.ok_or("Missing --mode parameter")?;
+    
+    // Target is only required for tcp and http modes
+    let target = if mode == "socks5" {
+        None
+    } else {
+        Some(target_addr.ok_or("Missing --target parameter for tcp/http mode")?)
+    };
 
     // Default to 128KB cache if not specified
     let cache_size_str = cache_size.unwrap_or_else(|| "128kb".to_string());
@@ -101,14 +117,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if mode != "tcp" && mode != "http" {
-        eprintln!("Mode must be either 'tcp' or 'http'");
+    if mode != "tcp" && mode != "http" && mode != "socks5" {
+        eprintln!("Mode must be 'tcp', 'http', or 'socks5'");
         std::process::exit(1);
     }
 
-    if let Err(e) = validate_no_self_connection(&listen, &target) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    // Validate no self-connection for tcp/http modes
+    if let Some(ref target_addr) = target {
+        if let Err(e) = validate_no_self_connection(&listen, target_addr) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 
     let cache_display = if cache_size_bytes == 0 {
@@ -119,10 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{}KB", cache_size_bytes / 1024)
     };
 
-    info!("Starting {} proxy: {} -> {} (cache: {})", mode, listen, target, cache_display);
+    match mode.as_str() {
+        "socks5" => {
+            info!("Starting SOCKS5 proxy on {} (cache: {})", listen, cache_display);
+        }
+        _ => {
+            info!("Starting {} proxy: {} -> {} (cache: {})", mode, listen, target.as_ref().unwrap(), cache_display);
+        }
+    }
 
     match mode.as_str() {
         "tcp" => {
+            let target = target.unwrap();
             let proxy = TcpProxy::new(&listen, &target, cache_size_bytes);
             if let Err(e) = proxy.start().await {
                 error!("TCP proxy error: {}", e);
@@ -130,9 +157,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "http" => {
+            let target = target.unwrap();
             let proxy = HttpProxy::new(&listen, &target, cache_size_bytes);
             if let Err(e) = proxy.start().await {
                 error!("HTTP proxy error: {}", e);
+                return Err(e);
+            }
+        }
+        "socks5" => {
+            let proxy = if let Some(auth_str) = socks5_auth {
+                let parts: Vec<&str> = auth_str.split(':').collect();
+                if parts.len() != 2 {
+                    eprintln!("SOCKS5 auth must be in format 'username:password'");
+                    std::process::exit(1);
+                }
+                Socks5Proxy::with_auth(&listen, cache_size_bytes, parts[0].to_string(), parts[1].to_string())
+            } else {
+                Socks5Proxy::new(&listen, cache_size_bytes)
+            };
+            
+            if let Err(e) = proxy.start().await {
+                error!("SOCKS5 proxy error: {}", e);
                 return Err(e);
             }
         }
