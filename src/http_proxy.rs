@@ -3,7 +3,7 @@ use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{error, info, debug};
+use tracing::{error, info};
 use crate::connection_cache::ConnectionCache;
 use crate::stats::StatsCollector;
 
@@ -15,6 +15,7 @@ pub struct HttpProxy {
 }
 
 impl HttpProxy {
+    #[allow(dead_code)]
     pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
@@ -77,13 +78,6 @@ impl HttpProxy {
     }
 }
 
-async fn proxy_handler_with_cache(req: Request<Body>, target_addr: String, _cache: ConnectionCache) -> Result<Response<Body>, Infallible> {
-    // Note: HTTP proxy connection caching is more complex due to hyper's Client handling
-    // For now, we'll use hyper's built-in connection pooling, but the cache parameter
-    // is available for future advanced implementations
-    debug!("HTTP request with cache support (using hyper's built-in pooling)");
-    proxy_handler(req, target_addr).await
-}
 
 async fn proxy_handler_with_stats(
     mut req: Request<Body>, 
@@ -184,6 +178,7 @@ async fn proxy_handler_with_stats(
     }
 }
 
+#[allow(dead_code)]
 async fn proxy_handler(mut req: Request<Body>, _target_addr: String) -> Result<Response<Body>, Infallible> {
     let client = Client::new();
     

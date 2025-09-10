@@ -41,6 +41,7 @@ struct Socks5Request {
 }
 
 impl Socks5Proxy {
+    #[allow(dead_code)]
     pub fn new(bind_addr: &str, cache_size_bytes: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
@@ -52,6 +53,7 @@ impl Socks5Proxy {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_auth(bind_addr: &str, cache_size_bytes: usize, username: String, password: String) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),

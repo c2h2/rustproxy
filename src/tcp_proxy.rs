@@ -17,6 +17,7 @@ pub struct TcpProxy {
 }
 
 impl TcpProxy {
+    #[allow(dead_code)]
     pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),

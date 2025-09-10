@@ -1,5 +1,7 @@
 use rustproxy::{TcpProxy, HttpProxy, ConnectionCache};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration, timeout};
@@ -73,7 +75,8 @@ async fn test_full_tcp_proxy_integration() {
             let target_addr = target_addr.to_string();
             tokio::spawn(async move {
                 let cache = ConnectionCache::new(128 * 1024);
-                let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache).await;
+                let active_connections = Arc::new(AtomicUsize::new(0));
+                let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
             });
         }
     });
@@ -134,7 +137,8 @@ async fn test_concurrent_tcp_connections() {
             let target_addr = target_addr.to_string();
             tokio::spawn(async move {
                 let cache = rustproxy::ConnectionCache::new(128 * 1024);
-                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache).await;
+                let active_connections = Arc::new(AtomicUsize::new(0));
+                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
             });
         }
     });
@@ -182,7 +186,8 @@ async fn test_proxy_error_handling() {
             let invalid_target = "127.0.0.1:99999".to_string(); // Invalid port
             tokio::spawn(async move {
                 let cache = rustproxy::ConnectionCache::new(128 * 1024);
-                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, invalid_target, cache).await;
+                let active_connections = Arc::new(AtomicUsize::new(0));
+                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, invalid_target, cache, None, active_connections).await;
             });
         }
     });
