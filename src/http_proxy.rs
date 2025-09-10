@@ -149,13 +149,23 @@ async fn proxy_handler_with_stats(
                 }
             };
 
+            // Extract and measure request body
+            let (parts, body) = req.into_parts();
+            let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+            let request_size = body_bytes.len() as u64;
+            let req = Request::from_parts(parts, Body::from(body_bytes));
+
             match client.request(req).await {
                 Ok(resp) => {
-                    // Note: For HTTP requests, we can't easily track bytes without intercepting the body
-                    // This would require more complex body streaming. For now, we'll track connections only.
+                    // Extract and measure response body
+                    let (parts, body) = resp.into_parts();
+                    let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+                    let response_size = body_bytes.len() as u64;
+                    let resp = Response::from_parts(parts, Body::from(body_bytes));
+                    
+                    // Update stats with actual bytes transferred
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                        // Estimate based on headers size (simplified tracking)
-                        stats.update_connection(conn_id, 1024, 1024).await;
+                        stats.update_connection(conn_id, request_size, response_size).await;
                         stats.close_connection(conn_id).await;
                     }
                     Ok(resp)
@@ -324,7 +334,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        let uri = Uri::try_from("http://127.0.0.1:8080/api/test").unwrap();
+        let uri = Uri::try_from(format!("http://127.0.0.1:{}/api/test", mock_addr.port())).unwrap();
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
