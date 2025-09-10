@@ -150,30 +150,34 @@ impl TcpProxy {
         let client_to_server = tokio::io::copy(&mut ri, &mut wo);
         let server_to_client = tokio::io::copy(&mut ro, &mut wi);
 
-        let result = tokio::try_join!(client_to_server, server_to_client);
+        // Use join instead of try_join to capture partial byte counts even on failures
+        let (result1, result2) = tokio::join!(client_to_server, server_to_client);
         
-        // Properly close connections and update stats
-        match result {
-            Ok((bytes_to_server, bytes_to_client)) => {
-                info!(
-                    "Connection {} closed. Transferred {} bytes to server, {} bytes to client",
-                    client_addr, bytes_to_server, bytes_to_client
-                );
-                
-                // Update stats if enabled
-                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                    stats.update_connection(conn_id, bytes_to_server, bytes_to_client).await;
-                    stats.close_connection(conn_id).await;
-                }
+        // Extract byte counts from results, defaulting to 0 on error
+        let bytes_to_server = match &result1 {
+            Ok(bytes) => *bytes,
+            Err(e1) => {
+                debug!("Client-to-server copy error for {}: {}", client_addr, e1);
+                0
             }
-            Err(e) => {
-                debug!("Connection ended for {}: {}", client_addr, e);
-                
-                // Close connection in stats if enabled
-                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                    stats.close_connection(conn_id).await;
-                }
+        };
+        let bytes_to_client = match &result2 {
+            Ok(bytes) => *bytes,
+            Err(e2) => {
+                debug!("Server-to-client copy error for {}: {}", client_addr, e2);
+                0
             }
+        };
+        
+        info!(
+            "Connection {} closed. Transferred {} bytes to server, {} bytes to client",
+            client_addr, bytes_to_server, bytes_to_client
+        );
+        
+        // Update stats with actual bytes transferred (even if partial)
+        if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+            stats.update_connection(conn_id, bytes_to_server, bytes_to_client).await;
+            stats.close_connection(conn_id).await;
         }
         
         // Reassemble and try to return connection to cache

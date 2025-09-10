@@ -380,27 +380,34 @@ impl Socks5Proxy {
         let client_to_target = tokio::io::copy(&mut client_read, &mut target_write);
         let target_to_client = tokio::io::copy(&mut target_read, &mut client_write);
 
-        match tokio::try_join!(client_to_target, target_to_client) {
-            Ok((bytes_to_target, bytes_to_client)) => {
-                info!(
-                    "SOCKS5 connection {} closed. Transferred {} bytes to target, {} bytes to client",
-                    client_addr, bytes_to_target, bytes_to_client
-                );
-                
-                // Update stats if enabled
-                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                    stats.update_connection(conn_id, bytes_to_target, bytes_to_client).await;
-                    stats.close_connection(conn_id).await;
-                }
+        // Use join instead of try_join to capture partial byte counts even on failures
+        let (result1, result2) = tokio::join!(client_to_target, target_to_client);
+        
+        // Extract byte counts from results, defaulting to 0 on error
+        let bytes_to_target = match &result1 {
+            Ok(bytes) => *bytes,
+            Err(e1) => {
+                debug!("Client-to-target copy error for {}: {}", client_addr, e1);
+                0
             }
-            Err(e) => {
-                error!("Error in SOCKS5 bidirectional copy for {}: {}", client_addr, e);
-                
-                // Close connection in stats if enabled
-                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                    stats.close_connection(conn_id).await;
-                }
+        };
+        let bytes_to_client = match &result2 {
+            Ok(bytes) => *bytes,
+            Err(e2) => {
+                debug!("Target-to-client copy error for {}: {}", client_addr, e2);
+                0
             }
+        };
+        
+        info!(
+            "SOCKS5 connection {} closed. Transferred {} bytes to target, {} bytes to client",
+            client_addr, bytes_to_target, bytes_to_client
+        );
+        
+        // Update stats with actual bytes transferred (even if partial)
+        if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+            stats.update_connection(conn_id, bytes_to_target, bytes_to_client).await;
+            stats.close_connection(conn_id).await;
         }
 
         Ok(())
