@@ -1,8 +1,10 @@
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, debug, warn};
 use crate::connection_cache::ConnectionCache;
+use crate::stats::StatsCollector;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_NO_AUTH: u8 = 0x00;
@@ -28,6 +30,7 @@ pub struct Socks5Proxy {
     auth_required: bool,
     username: Option<String>,
     password: Option<String>,
+    stats: Option<Arc<StatsCollector>>,
 }
 
 #[derive(Debug)]
@@ -45,6 +48,7 @@ impl Socks5Proxy {
             auth_required: false,
             username: None,
             password: None,
+            stats: None,
         }
     }
 
@@ -55,6 +59,37 @@ impl Socks5Proxy {
             auth_required: true,
             username: Some(username),
             password: Some(password),
+            stats: None,
+        }
+    }
+    
+    pub fn with_stats(bind_addr: &str, cache_size_bytes: usize, manager_addr: Option<SocketAddr>) -> Self {
+        let stats = manager_addr.map(|addr| {
+            Arc::new(StatsCollector::new("socks5", bind_addr, Some(addr)))
+        });
+        
+        Self {
+            bind_addr: bind_addr.to_string(),
+            cache: ConnectionCache::new(cache_size_bytes),
+            auth_required: false,
+            username: None,
+            password: None,
+            stats,
+        }
+    }
+    
+    pub fn with_auth_and_stats(bind_addr: &str, cache_size_bytes: usize, username: String, password: String, manager_addr: Option<SocketAddr>) -> Self {
+        let stats = manager_addr.map(|addr| {
+            Arc::new(StatsCollector::new("socks5", bind_addr, Some(addr)))
+        });
+        
+        Self {
+            bind_addr: bind_addr.to_string(),
+            cache: ConnectionCache::new(cache_size_bytes),
+            auth_required: true,
+            username: Some(username),
+            password: Some(password),
+            stats,
         }
     }
 
@@ -65,6 +100,11 @@ impl Socks5Proxy {
         info!("SOCKS5 proxy listening on {} (cache: {}/{}KB, auth: {})", 
               self.bind_addr, current_cache / 1024, max_cache / 1024, 
               if self.auth_required { "enabled" } else { "disabled" });
+        
+        // Start stats reporting if enabled
+        if let Some(ref stats) = self.stats {
+            stats.clone().start_reporting().await;
+        }
 
         loop {
             let (inbound, client_addr) = listener.accept().await?;
@@ -251,6 +291,13 @@ impl Socks5Proxy {
         let target_addr = format!("{}:{}", request.addr, request.port);
         
         debug!("SOCKS5 CONNECT request from {} to {}", client_addr, target_addr);
+        
+        // Create stats connection ID if stats are enabled
+        let conn_id = if let Some(ref stats) = self.stats {
+            Some(stats.new_connection(client_addr, target_addr.clone()).await)
+        } else {
+            None
+        };
 
         // Try to get a cached connection first
         let target_stream = match self.cache.get_connection(&target_addr).await {
@@ -264,6 +311,12 @@ impl Socks5Proxy {
                     Ok(stream) => stream,
                     Err(e) => {
                         warn!("Failed to connect to {}: {}", target_addr, e);
+                        
+                        // Close connection in stats if enabled
+                        if let (Some(ref stats), Some(ref conn_id)) = (&self.stats, &conn_id) {
+                            stats.close_connection(conn_id).await;
+                        }
+                        
                         self.send_error_response(&mut client_stream, SOCKS5_REP_HOST_UNREACHABLE).await?;
                         return Err(e.into());
                     }
@@ -277,7 +330,7 @@ impl Socks5Proxy {
         info!("SOCKS5 connection established: {} -> {}", client_addr, target_addr);
 
         // Start proxying data
-        self.proxy_data(client_stream, target_stream, client_addr, target_addr).await?;
+        self.proxy_data(client_stream, target_stream, client_addr, target_addr, self.stats.clone(), conn_id).await?;
 
         Ok(())
     }
@@ -318,7 +371,7 @@ impl Socks5Proxy {
         Ok(())
     }
 
-    async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, _target_addr: String) -> Result<(), Box<dyn std::error::Error>> {
+    async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, _target_addr: String, stats: Option<Arc<StatsCollector>>, conn_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         let (mut client_read, mut client_write) = client_stream.into_split();
         let (mut target_read, mut target_write) = target_stream.into_split();
 
@@ -331,9 +384,20 @@ impl Socks5Proxy {
                     "SOCKS5 connection {} closed. Transferred {} bytes to target, {} bytes to client",
                     client_addr, bytes_to_target, bytes_to_client
                 );
+                
+                // Update stats if enabled
+                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+                    stats.update_connection(conn_id, bytes_to_target, bytes_to_client).await;
+                    stats.close_connection(conn_id).await;
+                }
             }
             Err(e) => {
                 error!("Error in SOCKS5 bidirectional copy for {}: {}", client_addr, e);
+                
+                // Close connection in stats if enabled
+                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+                    stats.close_connection(conn_id).await;
+                }
             }
         }
 

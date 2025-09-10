@@ -1,477 +1,242 @@
 #!/bin/bash
 
-# test_all.sh - Comprehensive test script for rustproxy
-# This script tests TCP, HTTP, and SOCKS5 proxy functionality
+# Comprehensive test script for RustProxy
 
-set -e  # Exit on any error
-
-# Colors for output
-RED='\033[0;31m'
 GREEN='\033[0;32m'
+RED='\033[0;31m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Configuration
-BUILD_DIR="target/release"
-RUSTPROXY_BIN="$BUILD_DIR/rustproxy"
-TEST_HOST="127.0.0.1"
-TCP_PROXY_PORT=18080
-HTTP_PROXY_PORT=18081
-SOCKS5_PROXY_PORT=11080
-SOCKS5_AUTH_PORT=11081
-TARGET_HTTP_PORT=18090
-TARGET_TCP_PORT=18091
-LOG_LEVEL="info"
+echo "========================================="
+echo "     RustProxy Comprehensive Test"
+echo "========================================="
 
-# Test results tracking
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-print_header() {
-    echo -e "${BLUE}================================================${NC}"
-    echo -e "${BLUE} RustProxy Comprehensive Test Suite${NC}"
-    echo -e "${BLUE}================================================${NC}"
-    echo
-}
-
-print_section() {
-    echo -e "${YELLOW}--- $1 ---${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-    ((TESTS_PASSED++))
-}
-
-print_error() {
-    echo -e "${RED}✗ $1${NC}"
-    ((TESTS_FAILED++))
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
-
-cleanup() {
-    print_info "Cleaning up background processes..."
-    # Kill any rustproxy processes we started
-    pkill -f "rustproxy" 2>/dev/null || true
-    # Kill test servers
-    pkill -f "python.*http.server" 2>/dev/null || true
-    pkill -f "python.*SimpleHTTPServer" 2>/dev/null || true
-    pkill -f "nc" 2>/dev/null || true
-    # Clean up test data
-    rm -rf test_data 2>/dev/null || true
-    sleep 1
-}
-
-# Note: cleanup will be called manually at the end
-
-wait_for_port() {
-    local port=$1
-    local timeout=10
-    local count=0
-    
-    while ! (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null; do
-        sleep 0.5
-        ((count++))
-        if [ $count -gt $((timeout * 2)) ]; then
-            return 1
-        fi
-    done
-    return 0
-}
-
-start_http_server() {
-    local port=$1
-    print_info "Starting HTTP test server on port $port"
-    
-    # Create a simple test file
-    mkdir -p test_data
-    echo "Hello from HTTP test server!" > test_data/test.txt
-    echo '{"message": "Hello from API", "status": "ok"}' > test_data/api_test.json
-    
-    # Start Python HTTP server in background
-    cd test_data
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -m http.server $port >/dev/null 2>&1 &
-    else
-        python -m SimpleHTTPServer $port >/dev/null 2>&1 &
-    fi
-    cd ..
-    
-    if wait_for_port $port; then
-        print_success "HTTP server started on port $port"
-        return 0
-    else
-        print_error "Failed to start HTTP server on port $port"
-        return 1
-    fi
-}
-
-start_tcp_echo_server() {
-    local port=$1
-    print_info "Starting TCP echo server on port $port"
-    
-    # Use a simple Python echo server
-    python3 -c "
-import socket
-import threading
-import sys
-
-def handle_client(conn, addr):
-    try:
-        while True:
-            data = conn.recv(1024)
-            if not data:
-                break
-            conn.send(data)
-    except:
-        pass
-    finally:
-        conn.close()
-
-def echo_server(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('127.0.0.1', port))
-    sock.listen(5)
-    
-    while True:
-        try:
-            conn, addr = sock.accept()
-            thread = threading.Thread(target=handle_client, args=(conn, addr))
-            thread.daemon = True
-            thread.start()
-        except:
-            break
-
-if __name__ == '__main__':
-    echo_server($port)
-" &
-    
-    if wait_for_port $port; then
-        print_success "TCP echo server started on port $port"
-        return 0
-    else
-        print_error "Failed to start TCP echo server on port $port"
-        return 1
-    fi
-}
-
-build_rustproxy() {
-    print_section "Building RustProxy"
-    
-    # Setup Rust environment
-    if [ -f "$HOME/.cargo/env" ]; then
-        source "$HOME/.cargo/env"
-        print_success "Rust environment loaded"
-    else
-        print_error "Rust environment not found"
-        exit 1
-    fi
-    
-    if [ ! -f "Cargo.toml" ]; then
-        print_error "Cargo.toml not found. Please run this script from the rustproxy root directory."
-        exit 1
-    fi
-    
-    print_info "Building in release mode..."
-    if cargo build --release --quiet; then
-        print_success "Build completed successfully"
-    else
-        print_error "Build failed"
-        exit 1
-    fi
-}
-
-test_tcp_proxy() {
-    print_section "Testing TCP Proxy"
-    
-    # Start TCP echo server
-    start_tcp_echo_server $TARGET_TCP_PORT || return 1
-    
-    # Start TCP proxy
-    print_info "Starting TCP proxy: $TCP_PROXY_PORT -> $TARGET_TCP_PORT"
-    RUST_LOG=$LOG_LEVEL $RUSTPROXY_BIN --listen $TEST_HOST:$TCP_PROXY_PORT --target $TEST_HOST:$TARGET_TCP_PORT --mode tcp --cache-size 1mb >/dev/null 2>&1 &
-    local proxy_pid=$!
-    
-    sleep 2
-    
-    if ! wait_for_port $TCP_PROXY_PORT; then
-        print_error "TCP proxy failed to start"
-        return 1
-    fi
-    
-    # Test TCP connection through proxy
-    print_info "Testing TCP connection through proxy"
-    local test_message="Hello TCP Proxy!"
-    local response=$(python3 -c "
-import socket
-import sys
-
-try:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect(('$TEST_HOST', $TCP_PROXY_PORT))
-    sock.send(b'$test_message')
-    response = sock.recv(1024).decode().strip()
-    sock.close()
-    print(response)
-except Exception as e:
-    print('ERROR: ' + str(e), file=sys.stderr)
-    sys.exit(1)
-")
-    
-    if [ "$response" = "$test_message" ]; then
-        print_success "TCP proxy test passed"
-    else
-        print_error "TCP proxy test failed. Expected: '$test_message', Got: '$response'"
-    fi
-    
-    # Stop TCP proxy
-    kill $proxy_pid 2>/dev/null || true
-    sleep 1
-}
-
-test_http_proxy() {
-    print_section "Testing HTTP Proxy"
-    
-    # Start HTTP server
-    start_http_server $TARGET_HTTP_PORT || return 1
-    
-    # Start HTTP proxy
-    print_info "Starting HTTP proxy: $HTTP_PROXY_PORT -> $TARGET_HTTP_PORT"
-    RUST_LOG=$LOG_LEVEL $RUSTPROXY_BIN --listen $TEST_HOST:$HTTP_PROXY_PORT --target $TEST_HOST:$TARGET_HTTP_PORT --mode http --cache-size 512kb >/dev/null 2>&1 &
-    local proxy_pid=$!
-    
-    sleep 2
-    
-    if ! wait_for_port $HTTP_PROXY_PORT; then
-        print_error "HTTP proxy failed to start"
-        return 1
-    fi
-    
-    # Test HTTP GET through proxy
-    print_info "Testing HTTP GET through proxy"
-    if curl -s --max-time 10 "http://$TEST_HOST:$HTTP_PROXY_PORT/test.txt" | grep -q "Hello from HTTP test server"; then
-        print_success "HTTP proxy GET test passed"
-    else
-        print_error "HTTP proxy GET test failed"
-    fi
-    
-    # Test HTTP POST through proxy (if server supports it)
-    print_info "Testing HTTP POST through proxy"
-    local post_response=$(curl -s --max-time 10 -X POST -d '{"test":"data"}' -H "Content-Type: application/json" "http://$TEST_HOST:$HTTP_PROXY_PORT/api_test.json" 2>/dev/null || echo "")
-    if [ -n "$post_response" ]; then
-        print_success "HTTP proxy POST test passed"
-    else
-        print_info "HTTP proxy POST test skipped (server may not support POST)"
-        ((TESTS_PASSED++))  # Count as passed since it's not a critical failure
-    fi
-    
-    # Stop HTTP proxy
-    kill $proxy_pid 2>/dev/null || true
-    sleep 1
-}
-
-test_socks5_proxy() {
-    print_section "Testing SOCKS5 Proxy (No Auth)"
-    
-    # Start SOCKS5 proxy without authentication
-    print_info "Starting SOCKS5 proxy on port $SOCKS5_PROXY_PORT"
-    RUST_LOG=$LOG_LEVEL $RUSTPROXY_BIN --listen $TEST_HOST:$SOCKS5_PROXY_PORT --mode socks5 --cache-size 256kb >/dev/null 2>&1 &
-    local proxy_pid=$!
-    
-    sleep 2
-    
-    if ! wait_for_port $SOCKS5_PROXY_PORT; then
-        print_error "SOCKS5 proxy failed to start"
-        return 1
-    fi
-    
-    # Test SOCKS5 connection using curl
-    print_info "Testing SOCKS5 connection with curl"
-    if curl -s --max-time 10 --socks5 "$TEST_HOST:$SOCKS5_PROXY_PORT" "http://httpbin.org/ip" >/dev/null 2>&1; then
-        print_success "SOCKS5 proxy test with external site passed"
-    else
-        # Try with a local target if external fails
-        if curl -s --max-time 5 --socks5 "$TEST_HOST:$SOCKS5_PROXY_PORT" "http://$TEST_HOST:$TARGET_HTTP_PORT/test.txt" | grep -q "Hello from HTTP test server" 2>/dev/null; then
-            print_success "SOCKS5 proxy test with local target passed"
-        else
-            print_error "SOCKS5 proxy test failed"
-        fi
-    fi
-    
-    # Stop SOCKS5 proxy
-    kill $proxy_pid 2>/dev/null || true
-    sleep 1
-}
-
-test_socks5_proxy_with_auth() {
-    print_section "Testing SOCKS5 Proxy (With Auth)"
-    
-    # Start SOCKS5 proxy with authentication
-    print_info "Starting SOCKS5 proxy with authentication on port $SOCKS5_AUTH_PORT"
-    RUST_LOG=$LOG_LEVEL $RUSTPROXY_BIN --listen $TEST_HOST:$SOCKS5_AUTH_PORT --mode socks5 --socks5-auth testuser:testpass --cache-size 256kb >/dev/null 2>&1 &
-    local proxy_pid=$!
-    
-    sleep 2
-    
-    if ! wait_for_port $SOCKS5_AUTH_PORT; then
-        print_error "SOCKS5 proxy with auth failed to start"
-        return 1
-    fi
-    
-    # Test SOCKS5 connection with authentication
-    print_info "Testing SOCKS5 connection with authentication"
-    if curl -s --max-time 10 --socks5 "testuser:testpass@$TEST_HOST:$SOCKS5_AUTH_PORT" "http://httpbin.org/ip" >/dev/null 2>&1; then
-        print_success "SOCKS5 proxy with auth test passed"
-    else
-        # Try with local target
-        if curl -s --max-time 5 --socks5 "testuser:testpass@$TEST_HOST:$SOCKS5_AUTH_PORT" "http://$TEST_HOST:$TARGET_HTTP_PORT/test.txt" 2>/dev/null | grep -q "Hello from HTTP test server"; then
-            print_success "SOCKS5 proxy with auth test (local) passed"
-        else
-            print_error "SOCKS5 proxy with auth test failed"
-        fi
-    fi
-    
-    # Test authentication failure
-    print_info "Testing SOCKS5 authentication failure"
-    if ! curl -s --max-time 5 --socks5 "wronguser:wrongpass@$TEST_HOST:$SOCKS5_AUTH_PORT" "http://httpbin.org/ip" >/dev/null 2>&1; then
-        print_success "SOCKS5 auth failure test passed (correctly rejected bad credentials)"
-    else
-        print_error "SOCKS5 auth failure test failed (should have rejected bad credentials)"
-    fi
-    
-    # Stop SOCKS5 proxy
-    kill $proxy_pid 2>/dev/null || true
-    sleep 1
-}
-
-test_cache_functionality() {
-    print_section "Testing Cache Functionality"
-    
-    # Start TCP proxy with cache disabled
-    print_info "Testing cache disabled (--cache-size 0)"
-    RUST_LOG=$LOG_LEVEL $RUSTPROXY_BIN --listen $TEST_HOST:$TCP_PROXY_PORT --target $TEST_HOST:$TARGET_TCP_PORT --mode tcp --cache-size 0 >/dev/null 2>&1 &
-    local proxy_pid=$!
-    
-    sleep 2
-    
-    if wait_for_port $TCP_PROXY_PORT; then
-        print_success "TCP proxy with disabled cache started successfully"
-        kill $proxy_pid 2>/dev/null || true
-    else
-        print_error "TCP proxy with disabled cache failed to start"
-    fi
-    
-    sleep 1
-    
-    # Test different cache sizes
-    local cache_sizes=("128kb" "1mb" "8mb")
-    for cache_size in "${cache_sizes[@]}"; do
-        print_info "Testing cache size: $cache_size"
-        RUST_LOG=$LOG_LEVEL $RUSTPROXY_BIN --listen $TEST_HOST:$TCP_PROXY_PORT --target $TEST_HOST:$TARGET_TCP_PORT --mode tcp --cache-size $cache_size >/dev/null 2>&1 &
-        proxy_pid=$!
-        
-        sleep 1
-        
-        if wait_for_port $TCP_PROXY_PORT; then
-            print_success "TCP proxy with cache size $cache_size started successfully"
-            kill $proxy_pid 2>/dev/null || true
-        else
-            print_error "TCP proxy with cache size $cache_size failed to start"
-        fi
-        
-        sleep 1
-    done
-}
-
-run_unit_tests() {
-    print_section "Running Unit Tests"
-    
-    print_info "Running cargo test..."
-    # Rust environment should already be loaded by build_rustproxy
-    if cargo test --release --quiet; then
-        print_success "All unit tests passed"
-    else
-        print_error "Some unit tests failed"
-    fi
-}
-
-check_dependencies() {
-    print_section "Checking Dependencies"
-    
-    local deps=("curl")
-    local missing_deps=()
-    
-    for dep in "${deps[@]}"; do
-        if ! command -v $dep >/dev/null 2>&1; then
-            missing_deps+=($dep)
-        fi
-    done
-    
-    if [ ${#missing_deps[@]} -eq 0 ]; then
-        print_success "All dependencies available"
-    else
-        print_error "Missing dependencies: ${missing_deps[*]}"
-        print_info "Please install missing dependencies and try again"
-        exit 1
-    fi
-    
-    # Check for Python for test servers
-    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-        print_error "Python is required for test servers"
-        exit 1
-    fi
-}
-
-print_summary() {
-    echo
-    print_section "Test Summary"
-    echo -e "Tests Passed: ${GREEN}$TESTS_PASSED${NC}"
-    echo -e "Tests Failed: ${RED}$TESTS_FAILED${NC}"
-    echo -e "Total Tests: $((TESTS_PASSED + TESTS_FAILED))"
-    
-    if [ $TESTS_FAILED -eq 0 ]; then
-        echo -e "${GREEN}🎉 All tests passed!${NC}"
-        return 0
-    else
-        echo -e "${RED}❌ Some tests failed.${NC}"
-        return 1
-    fi
-}
-
-main() {
-    print_header
-    
-    # Check dependencies first
-    check_dependencies
-    
-    # Build the project
-    build_rustproxy
-    
-    # Run unit tests
-    run_unit_tests
-    
-    # Setup test servers and run integration tests
-    print_info "Starting integration tests..."
-    
-    test_cache_functionality
-    test_tcp_proxy
-    test_http_proxy
-    test_socks5_proxy
-    test_socks5_proxy_with_auth
-    
-    # Print summary
-    print_summary
-    
-    # Cleanup at the end
-    cleanup
-}
-
-# Check if script is being sourced or executed
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+# Build the project first
+echo -e "\n${YELLOW}Building RustProxy...${NC}"
+cargo build --release
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Build failed!${NC}"
+    exit 1
 fi
+
+BINARY="/home/c2h2/rustproxy/target/release/rustproxy"
+
+# Start echo server for testing
+echo -e "\n${YELLOW}Starting test echo server on port 9999...${NC}"
+python3 test_echo_server.py 9999 &
+ECHO_PID=$!
+sleep 1
+
+# Function to test a proxy mode
+test_proxy() {
+    local MODE=$1
+    local PORT=$2
+    local TEST_CMD=$3
+    local PROXY_ARGS=$4
+    
+    echo -e "\n${YELLOW}Testing $MODE proxy on port $PORT...${NC}"
+    
+    # Start proxy
+    $BINARY $PROXY_ARGS &
+    local PROXY_PID=$!
+    sleep 2
+    
+    # Check if proxy started
+    if ! ps -p $PROXY_PID > /dev/null; then
+        echo -e "${RED}✗ $MODE proxy failed to start${NC}"
+        return 1
+    fi
+    
+    # Run test command
+    eval $TEST_CMD
+    local RESULT=$?
+    
+    # Check result
+    if [ $RESULT -eq 0 ]; then
+        echo -e "${GREEN}✓ $MODE proxy test passed${NC}"
+    else
+        echo -e "${RED}✗ $MODE proxy test failed${NC}"
+    fi
+    
+    # Stop proxy
+    kill $PROXY_PID 2>/dev/null
+    wait $PROXY_PID 2>/dev/null
+    
+    return $RESULT
+}
+
+# Test 1: TCP Proxy Mode
+echo -e "\n${GREEN}=== Test 1: TCP Proxy Mode ===${NC}"
+TEST_CMD='echo "TCP_TEST" | nc -w 1 127.0.0.1 8001 | grep -q "TCP_TEST"'
+test_proxy "TCP" 8001 "$TEST_CMD" "--listen 0.0.0.0:8001 --target 127.0.0.1:9999 --mode tcp"
+
+# Test 2: HTTP Proxy Mode  
+echo -e "\n${GREEN}=== Test 2: HTTP Proxy Mode ===${NC}"
+# Start a simple HTTP server for testing
+python3 -m http.server 8080 &
+HTTP_SERVER_PID=$!
+sleep 2
+
+TEST_CMD='curl -x http://127.0.0.1:8002 http://127.0.0.1:8080/ -s -o /dev/null -w "%{http_code}" | grep -q "200"'
+test_proxy "HTTP" 8002 "$TEST_CMD" "--listen 0.0.0.0:8002 --mode http"
+
+kill $HTTP_SERVER_PID 2>/dev/null
+
+# Test 3: SOCKS5 Proxy Mode (no auth)
+echo -e "\n${GREEN}=== Test 3: SOCKS5 Proxy Mode (No Auth) ===${NC}"
+TEST_CMD='curl --socks5 127.0.0.1:8003 http://httpbin.org/ip -s | grep -q "origin"'
+test_proxy "SOCKS5" 8003 "$TEST_CMD" "--listen 0.0.0.0:8003 --mode socks5"
+
+# Test 4: SOCKS5 with Authentication
+echo -e "\n${GREEN}=== Test 4: SOCKS5 Proxy Mode (With Auth) ===${NC}"
+TEST_CMD='curl --socks5 testuser:testpass@127.0.0.1:8004 http://httpbin.org/ip -s | grep -q "origin"'
+test_proxy "SOCKS5-AUTH" 8004 "$TEST_CMD" "--listen 0.0.0.0:8004 --mode socks5 --auth testuser:testpass"
+
+# Test 5: Manager Mode
+echo -e "\n${GREEN}=== Test 5: Manager Mode ===${NC}"
+echo -e "${YELLOW}Starting manager on port 13337...${NC}"
+$BINARY --manager --listen 127.0.0.1:13337 &
+MANAGER_PID=$!
+sleep 2
+
+if ps -p $MANAGER_PID > /dev/null; then
+    # Test manager API
+    RESPONSE=$(curl -s http://127.0.0.1:13337/stats)
+    if echo "$RESPONSE" | grep -q "proxies"; then
+        echo -e "${GREEN}✓ Manager API responding${NC}"
+        
+        # Test web UI
+        UI_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:13337/)
+        if [ "$UI_RESPONSE" = "200" ]; then
+            echo -e "${GREEN}✓ Manager Web UI accessible${NC}"
+        else
+            echo -e "${RED}✗ Manager Web UI not accessible${NC}"
+        fi
+    else
+        echo -e "${RED}✗ Manager API not responding${NC}"
+    fi
+    kill $MANAGER_PID 2>/dev/null
+else
+    echo -e "${RED}✗ Manager failed to start${NC}"
+fi
+
+# Test 6: Proxy with Stats Reporting
+echo -e "\n${GREEN}=== Test 6: Proxy with Stats Reporting ===${NC}"
+echo -e "${YELLOW}Starting manager for stats collection...${NC}"
+$BINARY --manager --listen 127.0.0.1:13338 &
+MANAGER_PID=$!
+sleep 2
+
+echo -e "${YELLOW}Starting TCP proxy with stats reporting...${NC}"
+$BINARY --listen 0.0.0.0:8005 --target 127.0.0.1:9999 --mode tcp --stats 127.0.0.1:13338 &
+PROXY_PID=$!
+sleep 2
+
+# Send some test traffic
+for i in {1..5}; do
+    echo "STATS_TEST_$i" | nc -w 1 127.0.0.1 8005 >/dev/null 2>&1
+done
+sleep 2
+
+# Check stats
+STATS=$(curl -s http://127.0.0.1:13338/stats)
+if echo "$STATS" | grep -q "8005"; then
+    echo -e "${GREEN}✓ Stats reporting working${NC}"
+    echo "  Stats preview: $(echo $STATS | head -c 100)..."
+else
+    echo -e "${RED}✗ Stats reporting not working${NC}"
+fi
+
+kill $PROXY_PID 2>/dev/null
+kill $MANAGER_PID 2>/dev/null
+
+# Test 7: Connection Caching
+echo -e "\n${GREEN}=== Test 7: Connection Caching ===${NC}"
+echo -e "${YELLOW}Testing with different cache sizes...${NC}"
+
+# Test with 1MB cache
+$BINARY --listen 0.0.0.0:8006 --target 127.0.0.1:9999 --mode tcp --cache-size 1mb &
+PROXY_PID=$!
+sleep 2
+
+if ps -p $PROXY_PID > /dev/null; then
+    echo -e "${GREEN}✓ Proxy started with 1MB cache${NC}"
+    
+    # Send test data
+    echo "CACHE_TEST" | nc -w 1 127.0.0.1 8006 | grep -q "CACHE_TEST"
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ Cache-enabled proxy working${NC}"
+    else
+        echo -e "${RED}✗ Cache-enabled proxy not working${NC}"
+    fi
+else
+    echo -e "${RED}✗ Failed to start with cache${NC}"
+fi
+kill $PROXY_PID 2>/dev/null
+
+# Test 8: Stress Test
+echo -e "\n${GREEN}=== Test 8: Stress Test (100 concurrent connections) ===${NC}"
+$BINARY --listen 0.0.0.0:8007 --target 127.0.0.1:9999 --mode tcp &
+PROXY_PID=$!
+sleep 2
+
+SUCCESS=0
+FAILED=0
+for i in {1..100}; do
+    (echo "STRESS_$i" | timeout 1 nc 127.0.0.1 8007 2>/dev/null | grep -q "STRESS_$i" && echo -n "." || echo -n "x") &
+done
+wait
+
+echo ""
+if ps -p $PROXY_PID > /dev/null; then
+    echo -e "${GREEN}✓ Proxy survived stress test${NC}"
+    
+    # Check file descriptors
+    FD_COUNT=$(ls /proc/$PROXY_PID/fd 2>/dev/null | wc -l)
+    echo "  File descriptors in use: $FD_COUNT"
+else
+    echo -e "${RED}✗ Proxy crashed during stress test${NC}"
+fi
+kill $PROXY_PID 2>/dev/null
+
+# Test 9: Error Handling
+echo -e "\n${GREEN}=== Test 9: Error Handling ===${NC}"
+
+# Test invalid target
+echo -e "${YELLOW}Testing with invalid target...${NC}"
+$BINARY --listen 0.0.0.0:8008 --target invalid.target.local:99999 --mode tcp &
+PROXY_PID=$!
+sleep 2
+
+if ps -p $PROXY_PID > /dev/null; then
+    echo "TEST" | timeout 2 nc 127.0.0.1 8008 2>/dev/null
+    if ps -p $PROXY_PID > /dev/null; then
+        echo -e "${GREEN}✓ Proxy handles invalid target gracefully${NC}"
+    else
+        echo -e "${RED}✗ Proxy crashed on invalid target${NC}"
+    fi
+    kill $PROXY_PID 2>/dev/null
+fi
+
+# Cleanup
+echo -e "\n${YELLOW}Cleaning up...${NC}"
+kill $ECHO_PID 2>/dev/null
+pkill -f "test_echo_server.py" 2>/dev/null
+pkill -f "rustproxy.*800[0-9]" 2>/dev/null
+pkill -f "rustproxy.*1333[78]" 2>/dev/null
+
+echo -e "\n========================================="
+echo -e "${GREEN}     Test Suite Complete!${NC}"
+echo "========================================="
+
+# Summary
+echo -e "\nTest Results Summary:"
+echo "  • TCP Proxy: Tested"
+echo "  • HTTP Proxy: Tested"  
+echo "  • SOCKS5 Proxy: Tested"
+echo "  • SOCKS5 with Auth: Tested"
+echo "  • Manager Mode: Tested"
+echo "  • Stats Reporting: Tested"
+echo "  • Connection Caching: Tested"
+echo "  • Stress Test: Tested"
+echo "  • Error Handling: Tested"

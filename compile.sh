@@ -44,22 +44,21 @@ done
 echo ""
 echo -e "${YELLOW}🔧 Installing cross-compilation dependencies...${NC}"
 
-# Check if Docker is available for cross compilation
-if command -v docker &> /dev/null && docker version &> /dev/null; then
-    echo "  Docker available - will attempt to use cross"
-    # Install cross for easier cross-compilation
-    if ! command -v cross &> /dev/null; then
-        echo "  Installing cross..."
-        cargo install cross --git https://github.com/cross-rs/cross || {
-            echo -e "${RED}Failed to install cross. Will use cargo directly.${NC}"
-            USE_CARGO=true
-        }
-    else
-        echo "  cross already installed ✓"
-    fi
+# Check if cross is available for cross compilation
+if command -v cross &> /dev/null; then
+    echo "  cross tool available - will use for ARM64 compilation"
+    USE_CROSS=true
 else
-    echo -e "${YELLOW}  Docker not available - using native cargo compilation${NC}"
-    USE_CARGO=true
+    echo "  Installing cross..."
+    cargo install cross --git https://github.com/cross-rs/cross || {
+        echo -e "${RED}Failed to install cross. Will use cargo directly.${NC}"
+        USE_CROSS=false
+    }
+    if command -v cross &> /dev/null; then
+        USE_CROSS=true
+    else
+        USE_CROSS=false
+    fi
 fi
 
 echo ""
@@ -84,16 +83,20 @@ build_target() {
     
     echo -e "${BLUE}Building for ${arch_name} (${target})...${NC}"
     
-    # Try cross first, fall back to cargo
-    if [ "$USE_CARGO" = true ] || ! command -v cross &> /dev/null; then
-        echo "  Using cargo for compilation..."
-        cargo build --release --target "${target}" || {
-            echo -e "${RED}Failed to build for ${target}${NC}"
-            return 1
+    # Use cross for ARM64, cargo for x86_64
+    if [ "$target" = "aarch64-unknown-linux-gnu" ] && [ "$USE_CROSS" = true ]; then
+        echo "  Using cross for ARM64 compilation..."
+        cross build --release --target "${target}" || {
+            echo -e "${RED}Failed to build for ${target} with cross${NC}"
+            echo "  Falling back to cargo..."
+            cargo build --release --target "${target}" || {
+                echo -e "${RED}Failed to build for ${target} with cargo${NC}"
+                return 1
+            }
         }
     else
-        echo "  Using cross for compilation..."
-        cross build --release --target "${target}" || {
+        echo "  Using cargo for compilation..."
+        cargo build --release --target "${target}" || {
             echo -e "${RED}Failed to build for ${target}${NC}"
             return 1
         }

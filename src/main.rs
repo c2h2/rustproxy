@@ -6,6 +6,8 @@ mod tcp_proxy;
 mod http_proxy;
 mod socks5_proxy;
 mod connection_cache;
+pub mod stats;
+pub mod manager;
 
 #[cfg(test)]
 mod test_utils;
@@ -16,20 +18,32 @@ use socks5_proxy::Socks5Proxy;
 use connection_cache::parse_cache_size;
 
 fn print_usage() {
-    println!("Usage: rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [--cache-size <size>] [--socks5-auth <user:pass>]");
-    println!("Options:");
-    println!("  --listen <address:port>     Address to listen on");
-    println!("  --target <address:port>     Address to proxy to (required for tcp mode only)");
-    println!("  --mode <tcp|http|socks5>    Proxy mode");
-    println!("  --cache-size <size>         Connection cache size (default: 256kb)");
-    println!("                              Examples: 0, none, 256kb, 1mb, 8mb");
-    println!("  --socks5-auth <user:pass>   SOCKS5 authentication (optional)");
+    println!("Usage:");
+    println!("  rustproxy --manager [--listen <address:port>]");
+    println!("  rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [options]");
+    println!();
+    println!("Manager Mode:");
+    println!("  --manager                    Start in manager mode (default: 127.0.0.1:13337)");
+    println!("  --listen <address:port>      Manager HTTP interface address");
+    println!();
+    println!("Proxy Mode Options:");
+    println!("  --listen <address:port>      Address to listen on");
+    println!("  --target <address:port>      Address to proxy to (required for tcp mode only)");
+    println!("  --mode <tcp|http|socks5>     Proxy mode");
+    println!("  --cache-size <size>          Connection cache size (default: 256kb)");
+    println!("                               Examples: 0, none, 256kb, 1mb, 8mb");
+    println!("  --socks5-auth <user:pass>    SOCKS5 authentication (optional)");
+    println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!();
     println!("Examples:");
-    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 1mb");
+    println!("  rustproxy --manager");
+    println!("  rustproxy --manager --listen 0.0.0.0:13337");
+    println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --manager-addr 127.0.0.1:14337");
     println!("  rustproxy --listen 127.0.0.1:8080 --mode http");
-    println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5");
     println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5 --socks5-auth user:password");
+    println!();
+    println!("Environment Variables:");
+    println!("  RUSTPROXY_MANAGER=<addr:port>  Set manager address for stats reporting");
 }
 
 fn validate_no_self_connection(listen: &str, target: &str) -> Result<(), String> {
@@ -51,42 +65,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
     
-    if args.len() < 5 || args.len() > 11 {
+    if args.len() < 2 {
         print_usage();
         std::process::exit(1);
     }
 
+    // Check for manager mode first
+    if args.contains(&"--manager".to_string()) {
+        let mut listen_addr = "127.0.0.1:13337".to_string();
+        
+        for i in 1..args.len() {
+            if args[i] == "--listen" && i + 1 < args.len() {
+                listen_addr = args[i + 1].clone();
+            }
+        }
+        
+        info!("Starting RustProxy Manager on {}", listen_addr);
+        let manager = manager::Manager::new(&listen_addr);
+        return manager.start().await;
+    }
+
+    // Parse proxy mode arguments
     let mut listen_addr = None;
     let mut target_addr = None;
     let mut mode = None;
     let mut cache_size = None;
     let mut socks5_auth = None;
+    let mut manager_addr = None;
 
-    for i in (1..args.len()).step_by(2) {
+    let mut i = 1;
+    while i < args.len() {
         match args[i].as_str() {
             "--listen" => {
                 if i + 1 < args.len() {
                     listen_addr = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
             "--target" => {
                 if i + 1 < args.len() {
                     target_addr = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
             "--mode" => {
                 if i + 1 < args.len() {
                     mode = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
             "--cache-size" => {
                 if i + 1 < args.len() {
                     cache_size = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
             "--socks5-auth" => {
                 if i + 1 < args.len() {
                     socks5_auth = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--manager-addr" => {
+                if i + 1 < args.len() {
+                    manager_addr = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
             _ => {
@@ -132,6 +187,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Get manager address from command line or environment variable
+    let manager_socket_addr = manager_addr
+        .or_else(|| env::var("RUSTPROXY_MANAGER").ok())
+        .and_then(|addr| {
+            addr.parse::<SocketAddr>().ok().map(|mut socket_addr| {
+                // Manager UDP port is 1000 above HTTP port
+                socket_addr.set_port(socket_addr.port() + 1000);
+                socket_addr
+            })
+        });
+
+    if let Some(addr) = &manager_socket_addr {
+        info!("Stats reporting enabled to manager at {}", addr);
+    }
+
     let cache_display = if cache_size_bytes == 0 {
         "disabled".to_string()
     } else if cache_size_bytes >= 1024 * 1024 {
@@ -156,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode.as_str() {
         "tcp" => {
             let target = target.unwrap();
-            let proxy = TcpProxy::new(&listen, &target, cache_size_bytes);
+            let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr);
             if let Err(e) = proxy.start().await {
                 error!("TCP proxy error: {}", e);
                 return Err(e);
@@ -164,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "http" => {
             let target = target.unwrap_or_else(|| "".to_string());
-            let proxy = HttpProxy::new(&listen, &target, cache_size_bytes);
+            let proxy = HttpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr);
             if let Err(e) = proxy.start().await {
                 error!("HTTP proxy error: {}", e);
                 return Err(e);
@@ -177,9 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("SOCKS5 auth must be in format 'username:password'");
                     std::process::exit(1);
                 }
-                Socks5Proxy::with_auth(&listen, cache_size_bytes, parts[0].to_string(), parts[1].to_string())
+                Socks5Proxy::with_auth_and_stats(&listen, cache_size_bytes, parts[0].to_string(), parts[1].to_string(), manager_socket_addr)
             } else {
-                Socks5Proxy::new(&listen, cache_size_bytes)
+                Socks5Proxy::with_stats(&listen, cache_size_bytes, manager_socket_addr)
             };
             
             if let Err(e) = proxy.start().await {

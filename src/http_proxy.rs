@@ -2,13 +2,16 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::{error, info, debug};
 use crate::connection_cache::ConnectionCache;
+use crate::stats::StatsCollector;
 
 pub struct HttpProxy {
     bind_addr: String,
     target_addr: String,
     cache: ConnectionCache,
+    stats: Option<Arc<StatsCollector>>,
 }
 
 impl HttpProxy {
@@ -17,6 +20,20 @@ impl HttpProxy {
             bind_addr: bind_addr.to_string(),
             target_addr: target_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
+            stats: None,
+        }
+    }
+    
+    pub fn with_stats(bind_addr: &str, target_addr: &str, cache_size_bytes: usize, manager_addr: Option<SocketAddr>) -> Self {
+        let stats = manager_addr.map(|addr| {
+            Arc::new(StatsCollector::new("http", bind_addr, Some(addr)))
+        });
+        
+        Self {
+            bind_addr: bind_addr.to_string(),
+            target_addr: target_addr.to_string(),
+            cache: ConnectionCache::new(cache_size_bytes),
+            stats,
         }
     }
 
@@ -24,19 +41,28 @@ impl HttpProxy {
         let addr: SocketAddr = self.bind_addr.parse()?;
         let target = self.target_addr.clone();
         let cache = self.cache.clone();
+        let stats = self.stats.clone();
         
         let (current_cache, max_cache) = self.cache.get_cache_stats().await;
         info!("HTTP proxy listening on {} -> {} (cache: {}/{}KB)", 
               self.bind_addr, self.target_addr, current_cache / 1024, max_cache / 1024);
         
-        let make_svc = make_service_fn(move |_conn| {
+        // Start stats reporting if enabled
+        if let Some(ref stats) = self.stats {
+            stats.clone().start_reporting().await;
+        }
+        
+        let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
             let target = target.clone();
             let cache = cache.clone();
+            let stats = stats.clone();
+            let client_addr = conn.remote_addr();
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
                     let target = target.clone();
                     let cache = cache.clone();
-                    proxy_handler_with_cache(req, target, cache)
+                    let stats = stats.clone();
+                    proxy_handler_with_stats(req, target, cache, stats, client_addr)
                 }))
             }
         });
@@ -59,8 +85,120 @@ async fn proxy_handler_with_cache(req: Request<Body>, target_addr: String, _cach
     proxy_handler(req, target_addr).await
 }
 
-async fn proxy_handler(mut req: Request<Body>, target_addr: String) -> Result<Response<Body>, Infallible> {
+async fn proxy_handler_with_stats(
+    mut req: Request<Body>, 
+    _target_addr: String, 
+    _cache: ConnectionCache,
+    stats: Option<Arc<StatsCollector>>,
+    client_addr: SocketAddr,
+) -> Result<Response<Body>, Infallible> {
     let client = Client::new();
+    
+    // Extract target host from the request
+    let target_host = if let Some(host) = req.headers().get("host") {
+        host.to_str().unwrap_or("").to_string()
+    } else if let Some(authority) = req.uri().authority() {
+        authority.to_string()
+    } else {
+        error!("No host header or authority in request");
+        return Ok(Response::builder()
+            .status(400)
+            .body(Body::from("Bad Request: No host specified"))
+            .unwrap());
+    };
+    
+    // Extract target for stats
+    let target_for_stats = if req.method() == Method::CONNECT {
+        req.uri().to_string()
+    } else {
+        let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/");
+        format!("http://{}{}", target_host, path)
+    };
+    
+    // Create stats connection ID if stats are enabled
+    let conn_id = if let Some(ref stats) = stats {
+        Some(stats.new_connection(client_addr, target_for_stats.clone()).await)
+    } else {
+        None
+    };
+
+    match req.method() {
+        &Method::CONNECT => {
+            // Handle HTTPS CONNECT method
+            let response = Response::builder()
+                .status(200)
+                .body(Body::from("Connection established"))
+                .unwrap();
+            
+            // Close connection in stats
+            if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+                stats.close_connection(conn_id).await;
+            }
+            
+            Ok(response)
+        }
+        _ => {
+            // Handle regular HTTP requests by forwarding to target
+            let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/");
+            let target_uri = format!("http://{}{}", target_host, path);
+            
+            info!("Proxying HTTP request to: {}", target_uri);
+
+            *req.uri_mut() = match target_uri.parse() {
+                Ok(uri) => uri,
+                Err(e) => {
+                    error!("Failed to parse target URI {}: {}", target_uri, e);
+                    return Ok(Response::builder()
+                        .status(400)
+                        .body(Body::from("Bad Request: Invalid target URI"))
+                        .unwrap());
+                }
+            };
+
+            match client.request(req).await {
+                Ok(resp) => {
+                    // Note: For HTTP requests, we can't easily track bytes without intercepting the body
+                    // This would require more complex body streaming. For now, we'll track connections only.
+                    if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+                        // Estimate based on headers size (simplified tracking)
+                        stats.update_connection(conn_id, 1024, 1024).await;
+                        stats.close_connection(conn_id).await;
+                    }
+                    Ok(resp)
+                }
+                Err(e) => {
+                    error!("Error proxying request: {}", e);
+                    
+                    // Close connection in stats
+                    if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+                        stats.close_connection(conn_id).await;
+                    }
+                    
+                    Ok(Response::builder()
+                        .status(500)
+                        .body(Body::from("Proxy error"))
+                        .unwrap())
+                }
+            }
+        }
+    }
+}
+
+async fn proxy_handler(mut req: Request<Body>, _target_addr: String) -> Result<Response<Body>, Infallible> {
+    let client = Client::new();
+    
+    // Extract target host from the request
+    let target_host = if let Some(host) = req.headers().get("host") {
+        host.to_str().unwrap_or("").to_string()
+    } else if let Some(authority) = req.uri().authority() {
+        authority.to_string()
+    } else {
+        error!("No host header or authority in request");
+        return Ok(Response::builder()
+            .status(400)
+            .body(Body::from("Bad Request: No host specified"))
+            .unwrap());
+    };
 
     match req.method() {
         &Method::CONNECT => {
@@ -73,11 +211,20 @@ async fn proxy_handler(mut req: Request<Body>, target_addr: String) -> Result<Re
         _ => {
             // Handle regular HTTP requests by forwarding to target
             let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/");
-            let target_uri = format!("http://{}{}", target_addr, path);
+            let target_uri = format!("http://{}{}", target_host, path);
             
             info!("Proxying HTTP request to: {}", target_uri);
 
-            *req.uri_mut() = target_uri.parse().unwrap();
+            *req.uri_mut() = match target_uri.parse() {
+                Ok(uri) => uri,
+                Err(e) => {
+                    error!("Failed to parse target URI {}: {}", target_uri, e);
+                    return Ok(Response::builder()
+                        .status(400)
+                        .body(Body::from("Bad Request: Invalid target URI"))
+                        .unwrap());
+                }
+            };
 
             match client.request(req).await {
                 Ok(resp) => Ok(resp),
