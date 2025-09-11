@@ -1,11 +1,28 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration as StdDuration, Instant};
+
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{timeout, Duration};
-use tracing::{error, info, debug, warn};
+use tokio::time::{sleep, timeout, Duration};
+
+use tracing::{debug, error, info, warn};
+
 use crate::connection_cache::ConnectionCache;
 use crate::stats::StatsCollector;
+
+/* ---------- Optional socket2 for portable TCP keepalive ---------- */
+#[cfg(any(unix, windows))]
+use socket2::{SockRef, TcpKeepalive};
+
+/* ------------------------------ Config ------------------------------ */
+
+const REPORT_INTERVAL_SECS: u64 = 30; // periodic reporter interval
+const RECENT_WINDOW: StdDuration = StdDuration::from_secs(5 * 60); // 5 minutes
+
+/* ------------------------------ TcpProxy ------------------------------ */
 
 pub struct TcpProxy {
     bind_addr: String,
@@ -14,6 +31,17 @@ pub struct TcpProxy {
     stats: Option<Arc<StatsCollector>>,
     active_connections: Arc<AtomicUsize>,
     max_connections: usize,
+
+    // Accumulated traffic counters
+    total_tx_bytes: Arc<AtomicU64>, // client -> server
+    total_rx_bytes: Arc<AtomicU64>, // server -> client
+
+    // Recent connections: (time, client_ip)
+    recent_conns: Arc<tokio::sync::Mutex<Vec<(Instant, IpAddr)>>>,
+
+    // For log context
+    start_time: Instant,
+    listen_port: Arc<AtomicUsize>, // set after bind()
 }
 
 impl TcpProxy {
@@ -25,75 +53,177 @@ impl TcpProxy {
             cache: ConnectionCache::new(cache_size_bytes),
             stats: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections: 10000, // Default max connections
+            max_connections: 10000,
+            total_tx_bytes: Arc::new(AtomicU64::new(0)),
+            total_rx_bytes: Arc::new(AtomicU64::new(0)),
+            recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
+            start_time: Instant::now(),
+            listen_port: Arc::new(AtomicUsize::new(0)),
         }
     }
-    
-    pub fn with_stats(bind_addr: &str, target_addr: &str, cache_size_bytes: usize, manager_addr: Option<SocketAddr>) -> Self {
-        let stats = manager_addr.map(|addr| {
-            Arc::new(StatsCollector::new("tcp", bind_addr, Some(addr)))
-        });
-        
+
+    pub fn with_stats(
+        bind_addr: &str,
+        target_addr: &str,
+        cache_size_bytes: usize,
+        manager_addr: Option<SocketAddr>,
+    ) -> Self {
+        let stats =
+            manager_addr.map(|addr| Arc::new(StatsCollector::new("tcp", bind_addr, Some(addr))));
         Self {
             bind_addr: bind_addr.to_string(),
             target_addr: target_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
             stats,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections: 10000, // Default max connections
+            max_connections: 10000,
+            total_tx_bytes: Arc::new(AtomicU64::new(0)),
+            total_rx_bytes: Arc::new(AtomicU64::new(0)),
+            recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
+            start_time: Instant::now(),
+            listen_port: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        self.listen_port
+            .store(local_addr.port() as usize, Ordering::Relaxed);
+
         let (current_cache, max_cache) = self.cache.get_cache_stats().await;
-        info!("TCP proxy listening on {} -> {} (cache: {}/{}KB, max connections: {})", 
-              self.bind_addr, self.target_addr, current_cache / 1024, max_cache / 1024, self.max_connections);
-        
+        info!(
+            "TCP proxy listening on {} -> {} (cache: {}/{}KB, max connections: {})",
+            local_addr,
+            self.target_addr,
+            current_cache / 1024,
+            max_cache / 1024,
+            self.max_connections
+        );
+
         // Start stats reporting if enabled
         if let Some(stats) = &self.stats {
             stats.clone().start_reporting().await;
         }
 
+        // Periodic reporter (warn! with port + uptime + totals + last-5m IPs)
+        self.spawn_periodic_reporter();
+
         loop {
             match listener.accept().await {
                 Ok((inbound, client_addr)) => {
-                    let current_connections = self.active_connections.load(Ordering::Relaxed);
-                    
-                    // Check if we've reached the connection limit
-                    if current_connections >= self.max_connections {
-                        warn!("Connection limit reached ({}/{}), rejecting connection from {}", 
-                              current_connections, self.max_connections, client_addr);
-                        drop(inbound); // Close the connection immediately
+                    let current = self.active_connections.load(Ordering::Relaxed);
+                    if current >= self.max_connections {
+                        warn!(
+                            "Connection limit reached ({}/{}), rejecting connection from {}",
+                            current, self.max_connections, client_addr
+                        );
+                        drop(inbound);
                         continue;
                     }
-                    
+
+                    // Record recent connection for last-5m stats
+                    {
+                        let recent = self.recent_conns.clone();
+                        let ip = client_addr.ip();
+                        tokio::spawn(async move {
+                            let mut v = recent.lock().await;
+                            v.push((Instant::now(), ip));
+                        });
+                    }
+
                     let target_addr = self.target_addr.clone();
                     let cache = self.cache.clone();
                     let stats = self.stats.clone();
                     let active_connections = self.active_connections.clone();
-                    
-                    // Increment active connections counter
+                    let total_tx_bytes = self.total_tx_bytes.clone();
+                    let total_rx_bytes = self.total_rx_bytes.clone();
+
                     active_connections.fetch_add(1, Ordering::Relaxed);
-                    
+
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection_with_cache(
-                            inbound, client_addr, target_addr, cache, stats, active_connections.clone()
-                        ).await {
+                            inbound,
+                            client_addr,
+                            target_addr,
+                            cache,
+                            stats,
+                            active_connections.clone(),
+                            total_tx_bytes,
+                            total_rx_bytes,
+                        )
+                        .await
+                        {
                             error!("Error handling connection from {}: {}", client_addr, e);
                         }
-                        
-                        // Decrement active connections counter when done
                         active_connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
                     error!("Failed to accept connection: {}", e);
-                    // Add a small delay to prevent tight loop on persistent errors
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_millis(100)).await;
                 }
             }
         }
+    }
+
+    fn spawn_periodic_reporter(&self) {
+        let total_tx = self.total_tx_bytes.clone();
+        let total_rx = self.total_rx_bytes.clone();
+        let recent = self.recent_conns.clone();
+        let start_time = self.start_time;
+        let listen_port = self.listen_port.clone();
+
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(REPORT_INTERVAL_SECS)).await;
+
+                // Snapshot totals
+                let tx = total_tx.load(Ordering::Relaxed);
+                let rx = total_rx.load(Ordering::Relaxed);
+
+                // Compute uptime (hours with two decimals)
+                let uptime_h = Instant::now().duration_since(start_time).as_secs_f64() / 3600.0;
+
+                // Build last-5m IP->count map and prune old entries
+                let mut ip_counts: HashMap<IpAddr, usize> = HashMap::new();
+                let now = Instant::now();
+                {
+                    let mut v = recent.lock().await;
+                    v.retain(|(t, _)| now.duration_since(*t) <= RECENT_WINDOW);
+                    for (_t, ip) in v.iter() {
+                        *ip_counts.entry(*ip).or_insert(0) += 1;
+                    }
+                }
+
+                // Format compact IP list (cap to 10 entries + ellipsis)
+                let mut parts: Vec<String> = ip_counts
+                    .into_iter()
+                    .map(|(ip, c)| format!("{}({})", ip, c))
+                    .collect();
+                parts.sort();
+                if parts.len() > 10 {
+                    parts.truncate(10);
+                    parts.push("…".to_string());
+                }
+
+                // Count of unique IPs (excluding ellipsis)
+                let unique_count = parts
+                    .last()
+                    .map(|s| if s == "…" { parts.len() - 1 } else { parts.len() })
+                    .unwrap_or(0);
+
+                warn!(
+                    ":{} [uptime {:.2}h] Traffic totals: TX {:.2} MiB, RX {:.2} MiB | Last 5m unique IPs: {} [{}]",
+                    listen_port.load(Ordering::Relaxed),
+                    uptime_h,
+                    bytes_to_mib(tx),
+                    bytes_to_mib(rx),
+                    unique_count,
+                    parts.join(", ")
+                );
+            }
+        });
     }
 
     pub async fn handle_connection_with_cache(
@@ -103,6 +233,8 @@ impl TcpProxy {
         cache: ConnectionCache,
         stats: Option<Arc<StatsCollector>>,
         _active_connections: Arc<AtomicUsize>,
+        total_tx_bytes: Arc<AtomicU64>,
+        total_rx_bytes: Arc<AtomicU64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create stats connection ID if stats are enabled
         let conn_id = if let Some(ref stats) = stats {
@@ -110,8 +242,8 @@ impl TcpProxy {
         } else {
             None
         };
-        
-        // Try to get a cached connection first
+
+        // Get or create outbound
         let mut outbound = match cache.get_connection(&target_addr).await {
             Some(conn) => {
                 debug!("Using cached connection for {} -> {}", client_addr, target_addr);
@@ -119,7 +251,6 @@ impl TcpProxy {
             }
             None => {
                 debug!("Creating new connection for {} -> {}", client_addr, target_addr);
-                // Add timeout to prevent hanging connections
                 match timeout(Duration::from_secs(10), TcpStream::connect(&target_addr)).await {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => {
@@ -140,189 +271,297 @@ impl TcpProxy {
             }
         };
 
+        // Latency/health hints
+        let _ = inbound.set_nodelay(true);
+        let _ = outbound.set_nodelay(true);
+
+        // Configure TCP keepalive (portable via socket2)
+        #[cfg(any(unix, windows))]
+        {
+            let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
+            let _ = SockRef::from(&inbound).set_tcp_keepalive(&ka);
+            let _ = SockRef::from(&outbound).set_tcp_keepalive(&ka);
+        }
+
         info!("Proxying connection from {} to {}", client_addr, target_addr);
 
-        // Split both connections
-        let (mut ri, mut wi) = inbound.split();
-        let (mut ro, mut wo) = outbound.split();
+        // Split and pump both directions
+        let (ri, wi) = inbound.split();
+        let (ro, wo) = outbound.split();
 
-        // Perform bidirectional copy
-        let client_to_server = tokio::io::copy(&mut ri, &mut wo);
-        let server_to_client = tokio::io::copy(&mut ro, &mut wi);
+        let c2s = pump(ri, wo); // client -> server
+        let s2c = pump(ro, wi); // server -> client
 
-        // Use join instead of try_join to capture partial byte counts even on failures
-        let (result1, result2) = tokio::join!(client_to_server, server_to_client);
-        
-        // Extract byte counts from results, defaulting to 0 on error
-        let bytes_to_server = match &result1 {
-            Ok(bytes) => *bytes,
-            Err(e1) => {
-                debug!("Client-to-server copy error for {}: {}", client_addr, e1);
-                0
-            }
+        let (r1, r2) = tokio::join!(c2s, s2c);
+
+        let (bytes_to_server, e1_opt) = match r1 {
+            Ok(n) => (n, None),
+            Err(pe) => (pe.bytes, Some(pe.source)),
         };
-        let bytes_to_client = match &result2 {
-            Ok(bytes) => *bytes,
-            Err(e2) => {
-                debug!("Server-to-client copy error for {}: {}", client_addr, e2);
-                0
-            }
+        let (bytes_to_client, e2_opt) = match r2 {
+            Ok(n) => (n, None),
+            Err(pe) => (pe.bytes, Some(pe.source)),
         };
-        
+
+        if let Some(e) = e1_opt {
+            debug!(
+                "Client->Server ended with error after {} bytes for {}: {}",
+                bytes_to_server, client_addr, e
+            );
+        }
+        if let Some(e) = e2_opt {
+            debug!(
+                "Server->Client ended with error after {} bytes for {}: {}",
+                bytes_to_client, client_addr, e
+            );
+        }
+
+        // Global totals
+        total_tx_bytes.fetch_add(bytes_to_server, Ordering::Relaxed);
+        total_rx_bytes.fetch_add(bytes_to_client, Ordering::Relaxed);
+
         info!(
             "Connection {} closed. Transferred {} bytes to server, {} bytes to client",
             client_addr, bytes_to_server, bytes_to_client
         );
-        
-        // Update stats with actual bytes transferred (even if partial)
+
+        // External stats
         if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-            stats.update_connection(conn_id, bytes_to_server, bytes_to_client).await;
+            stats
+                .update_connection(conn_id, bytes_to_server, bytes_to_client)
+                .await;
             stats.close_connection(conn_id).await;
         }
-        
-        // Reassemble and try to return connection to cache
-        // Note: We need to reassemble the streams back into a TcpStream
-        // Since we can't easily reassemble split streams, we'll skip caching for now
-        // This ensures proper cleanup of file descriptors
-        
+
         Ok(())
     }
-
 }
+
+/* -------------------------- Accurate pump -------------------------- */
+
+#[derive(Debug)]
+struct PumpErr {
+    bytes: u64,
+    source: io::Error,
+}
+
+impl std::fmt::Display for PumpErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (after {} bytes)", self.source, self.bytes)
+    }
+}
+impl std::error::Error for PumpErr {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Copy from reader to writer with precise accounting.
+/// - Ok(total) on EOF (after half-closing writer).
+/// - Err(PumpErr { bytes: total_so_far, source }) on I/O error.
+async fn pump<R, W>(mut r: R, mut w: W) -> Result<u64, PumpErr>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut total: u64 = 0;
+
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) => {
+                if let Err(e) = w.shutdown().await {
+                    return Err(PumpErr { bytes: total, source: e });
+                }
+                return Ok(total);
+            }
+            Ok(n) => n,
+            Err(e) => return Err(PumpErr { bytes: total, source: e }),
+        };
+
+        if let Err(e) = w.write_all(&buf[..n]).await {
+            return Err(PumpErr { bytes: total, source: e });
+        }
+
+        total += n as u64;
+    }
+}
+
+/* ------------------------------ Helpers ------------------------------ */
+
+fn bytes_to_mib(b: u64) -> f64 {
+    (b as f64) / (1024.0 * 1024.0)
+}
+
+/* ------------------------------ Tests ------------------------------ */
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::MockTcpServer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-    use tokio::time::{sleep, Duration};
 
     #[tokio::test]
     async fn test_tcp_proxy_basic_functionality() {
-        tracing_subscriber::fmt::try_init().ok();
+        let _ = tracing_subscriber::fmt::try_init();
 
         let mock_server = MockTcpServer::new().await.unwrap();
         let target_addr = mock_server.addr();
-        
         tokio::spawn(mock_server.echo_server());
 
-        let _proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024);
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024);
+        // Use start() loop pattern from original tests: we emulate acceptor here
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
-                let target_addr = target_addr.to_string();
-                tokio::spawn(async move {
-                    let cache = ConnectionCache::new(128 * 1024);
-                    let active_connections = Arc::new(AtomicUsize::new(0));
-                    let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
-                });
+            loop {
+                if let Ok((inbound, client_addr)) = listener.accept().await {
+                    let target_addr = target_addr.to_string();
+                    tokio::spawn(async move {
+                        let cache = ConnectionCache::new(128 * 1024);
+                        let active = Arc::new(AtomicUsize::new(0));
+                        let total_tx = Arc::new(AtomicU64::new(0));
+                        let total_rx = Arc::new(AtomicU64::new(0));
+                        let _ = TcpProxy::handle_connection_with_cache(
+                            inbound,
+                            client_addr,
+                            target_addr,
+                            cache,
+                            None,
+                            active,
+                            total_tx,
+                            total_rx,
+                        )
+                        .await;
+                    });
+                }
             }
         });
 
-        sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        let test_data = b"Hello, TCP Proxy!";
-        
-        client.write_all(test_data).await.unwrap();
-        
-        let mut buffer = [0; 1024];
-        let n = client.read(&mut buffer).await.unwrap();
-        
-        assert_eq!(&buffer[0..n], test_data);
+        let msg = b"Hello, TCP Proxy!";
+        client.write_all(msg).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], msg);
+
+        // ensure proxy is used, avoid dead-code warn
+        assert_eq!(proxy.max_connections, 10000);
     }
 
     #[tokio::test]
     async fn test_tcp_proxy_multiple_connections() {
-        tracing_subscriber::fmt::try_init().ok();
+        let _ = tracing_subscriber::fmt::try_init();
 
         let mock_server = MockTcpServer::new().await.unwrap();
         let target_addr = mock_server.addr();
-        
         tokio::spawn(mock_server.echo_server());
 
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
-                let target_addr = target_addr.to_string();
-                tokio::spawn(async move {
-                    let cache = ConnectionCache::new(128 * 1024);
-                    let active_connections = Arc::new(AtomicUsize::new(0));
-                    let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
-                });
+            loop {
+                if let Ok((inbound, client_addr)) = listener.accept().await {
+                    let target_addr = target_addr.to_string();
+                    tokio::spawn(async move {
+                        let cache = ConnectionCache::new(128 * 1024);
+                        let active = Arc::new(AtomicUsize::new(0));
+                        let total_tx = Arc::new(AtomicU64::new(0));
+                        let total_rx = Arc::new(AtomicU64::new(0));
+                        let _ = TcpProxy::handle_connection_with_cache(
+                            inbound,
+                            client_addr,
+                            target_addr,
+                            cache,
+                            None,
+                            active,
+                            total_tx,
+                            total_rx,
+                        )
+                        .await;
+                    });
+                }
             }
         });
 
-        sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut handles = vec![];
-        
         for i in 0..5 {
-            let proxy_addr = proxy_addr;
-            let handle = tokio::spawn(async move {
-                let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-                let test_data = format!("Message {}", i);
-                
-                client.write_all(test_data.as_bytes()).await.unwrap();
-                
-                let mut buffer = [0; 1024];
-                let n = client.read(&mut buffer).await.unwrap();
-                
-                assert_eq!(&buffer[0..n], test_data.as_bytes());
-            });
-            handles.push(handle);
+            let addr = proxy_addr;
+            handles.push(tokio::spawn(async move {
+                let mut c = TcpStream::connect(addr).await.unwrap();
+                let msg = format!("Message {}", i);
+                c.write_all(msg.as_bytes()).await.unwrap();
+                let mut buf = [0u8; 1024];
+                let n = c.read(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], msg.as_bytes());
+            }));
         }
-
-        for handle in handles {
-            handle.await.unwrap();
+        for h in handles {
+            h.await.unwrap();
         }
     }
 
     #[tokio::test]
     async fn test_tcp_proxy_large_data() {
-        tracing_subscriber::fmt::try_init().ok();
+        let _ = tracing_subscriber::fmt::try_init();
 
         let mock_server = MockTcpServer::new().await.unwrap();
         let target_addr = mock_server.addr();
-        
         tokio::spawn(mock_server.echo_server());
 
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
-                let target_addr = target_addr.to_string();
-                tokio::spawn(async move {
-                    let cache = ConnectionCache::new(128 * 1024);
-                    let active_connections = Arc::new(AtomicUsize::new(0));
-                    let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
-                });
+            loop {
+                if let Ok((inbound, client_addr)) = listener.accept().await {
+                    let target_addr = target_addr.to_string();
+                    tokio::spawn(async move {
+                        let cache = ConnectionCache::new(128 * 1024);
+                        let active = Arc::new(AtomicUsize::new(0));
+                        let total_tx = Arc::new(AtomicU64::new(0));
+                        let total_rx = Arc::new(AtomicU64::new(0));
+                        let _ = TcpProxy::handle_connection_with_cache(
+                            inbound,
+                            client_addr,
+                            target_addr,
+                            cache,
+                            None,
+                            active,
+                            total_tx,
+                            total_rx,
+                        )
+                        .await;
+                    });
+                }
             }
         });
 
-        sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        let test_data = vec![b'A'; 8192]; // 8KB of data
-        
+        let test_data = vec![b'A'; 8192];
+
         client.write_all(&test_data).await.unwrap();
-        
+
         let mut buffer = vec![0; 8192];
-        let mut total_read = 0;
-        
+        let mut total_read = 0usize;
         while total_read < test_data.len() {
             let n = client.read(&mut buffer[total_read..]).await.unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             total_read += n;
         }
-        
+
         assert_eq!(total_read, test_data.len());
-        assert_eq!(&buffer[0..total_read], test_data.as_slice());
+        assert_eq!(&buffer[..total_read], test_data.as_slice());
     }
 }
