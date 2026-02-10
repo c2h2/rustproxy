@@ -14,7 +14,7 @@
     </style>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-6xl">
+    <div class="container mx-auto px-4 py-8 max-w-full">
 
         <!-- Header -->
         <div class="mb-8 flex items-center justify-between">
@@ -93,7 +93,7 @@
             const k = 1024;
             const units = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(b) / Math.log(k));
-            return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + units[i];
+            return Math.floor(b / Math.pow(k, i)) + ' ' + units[i];
         }
 
         function formatUptime(secs) {
