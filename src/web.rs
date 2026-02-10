@@ -141,8 +141,8 @@ pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/backends", get(api_backends))
-        .route("/api/backends/{id}/enable", post(api_enable_backend))
-        .route("/api/backends/{id}/disable", post(api_disable_backend))
+        .route("/api/backends/:id/enable", post(api_enable_backend))
+        .route("/api/backends/:id/disable", post(api_disable_backend))
         .route("/api/stats", get(api_stats))
         .route("/api/health", get(api_health))
         .with_state(state);
