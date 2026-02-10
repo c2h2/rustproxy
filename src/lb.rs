@@ -41,6 +41,12 @@ pub struct BackendStats {
     pub total_tx_bytes: AtomicU64,
     pub total_rx_bytes: AtomicU64,
     pub total_errors: AtomicU64,
+    /// Healthcheck response time in milliseconds (0 if error/timeout/never checked)
+    pub hc_response_ms: AtomicU64,
+    /// Healthcheck status: 0=unknown, 1=ok, 2=error, 3=timeout
+    pub hc_status: AtomicU64,
+    /// Last healthcheck epoch seconds (0=never)
+    pub hc_last_check_epoch: AtomicU64,
 }
 
 impl BackendStats {
@@ -51,6 +57,9 @@ impl BackendStats {
             total_tx_bytes: AtomicU64::new(0),
             total_rx_bytes: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
+            hc_response_ms: AtomicU64::new(0),
+            hc_status: AtomicU64::new(0),
+            hc_last_check_epoch: AtomicU64::new(0),
         }
     }
 }
@@ -87,6 +96,9 @@ pub struct BackendSnapshot {
     pub total_tx_bytes: u64,
     pub total_rx_bytes: u64,
     pub total_errors: u64,
+    pub hc_response_ms: u64,
+    pub hc_status: u64,
+    pub hc_last_check_epoch: u64,
 }
 
 /* ------------------------------ LoadBalancer ------------------------------ */
@@ -177,6 +189,9 @@ impl LoadBalancer {
                 total_tx_bytes: b.stats.total_tx_bytes.load(Ordering::Relaxed),
                 total_rx_bytes: b.stats.total_rx_bytes.load(Ordering::Relaxed),
                 total_errors: b.stats.total_errors.load(Ordering::Relaxed),
+                hc_response_ms: b.stats.hc_response_ms.load(Ordering::Relaxed),
+                hc_status: b.stats.hc_status.load(Ordering::Relaxed),
+                hc_last_check_epoch: b.stats.hc_last_check_epoch.load(Ordering::Relaxed),
             })
             .collect()
     }

@@ -6,6 +6,7 @@ pub mod stats;
 pub mod manager;
 pub mod lb;
 pub mod web;
+pub mod healthcheck;
 
 #[cfg(test)]
 pub mod test_utils;

@@ -69,6 +69,8 @@
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">TX</th>
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">RX</th>
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Errors</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">HC Time</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Last Check</th>
                             <th class="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase tracking-wider">Action</th>
                         </tr>
                     </thead>
@@ -105,6 +107,26 @@
             return s + 's';
         }
 
+        function formatHcStatus(b) {
+            // hc_status: 0=unknown, 1=ok, 2=error, 3=timeout
+            switch (b.hc_status) {
+                case 1: return '<span class="text-green-400 font-medium">' + b.hc_response_ms + 'ms</span>';
+                case 2: return '<span class="text-red-400 font-medium">error</span>';
+                case 3: return '<span class="text-yellow-400 font-medium">timeout</span>';
+                default: return '<span class="text-gray-500">-</span>';
+            }
+        }
+
+        function formatLastCheck(epochSecs) {
+            if (!epochSecs || epochSecs === 0) return '<span class="text-gray-500">never</span>';
+            const ago = Math.floor(Date.now() / 1000) - epochSecs;
+            if (ago < 0) return 'just now';
+            if (ago < 60) return ago + 's ago';
+            if (ago < 3600) return Math.floor(ago / 60) + 'm ago';
+            if (ago < 86400) return Math.floor(ago / 3600) + 'h ago';
+            return Math.floor(ago / 86400) + 'd ago';
+        }
+
         async function toggleBackend(id, enable) {
             const action = enable ? 'enable' : 'disable';
             try {
@@ -122,10 +144,11 @@
             tbody.innerHTML = '';
             backends.forEach(b => {
                 const hasErrors = b.total_errors > 0;
+                const hcFail = !b.enabled && (b.hc_status === 2 || b.hc_status === 3);
                 const statusColor = b.enabled
                     ? (hasErrors ? 'bg-yellow-500' : 'bg-green-500')
                     : 'bg-red-500';
-                const statusText = b.enabled ? 'UP' : 'DISABLED';
+                const statusText = b.enabled ? 'UP' : (hcFail ? 'HC FAIL' : 'DISABLED');
                 const statusBadge = b.enabled
                     ? (hasErrors
                         ? 'bg-yellow-900 text-yellow-200'
@@ -152,6 +175,8 @@
                     <td class="px-4 py-3 text-sm text-right">${formatBytes(b.total_tx_bytes)}</td>
                     <td class="px-4 py-3 text-sm text-right">${formatBytes(b.total_rx_bytes)}</td>
                     <td class="px-4 py-3 text-sm text-right ${hasErrors ? 'text-yellow-400 font-medium' : ''}">${b.total_errors}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatHcStatus(b)}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatLastCheck(b.hc_last_check_epoch)}</td>
                     <td class="px-4 py-3 text-center">
                         <button onclick="toggleBackend(${b.id}, ${!b.enabled})"
                             class="px-3 py-1 text-xs font-medium rounded text-white ${btnClass} transition-colors">

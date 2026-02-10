@@ -11,6 +11,7 @@ pub mod stats;
 pub mod manager;
 mod lb;
 mod web;
+mod healthcheck;
 
 #[cfg(test)]
 mod test_utils;
@@ -41,6 +42,7 @@ fn print_usage() {
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
+    println!("  --healthcheck                Enable SOCKS5 healthcheck for LB backends (60s interval)");
     println!();
     println!("Examples:");
     println!("  rustproxy --manager");
@@ -115,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut manager_addr = None;
     let mut lb_algorithm = None;
     let mut http_interface = None;
+    let mut healthcheck_enabled = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -183,6 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--healthcheck" => {
+                healthcheck_enabled = true;
+                i += 1;
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 print_usage();
@@ -223,6 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if mode != "tcp" && http_interface.is_some() {
         eprintln!("--http-interface is only valid with --mode tcp");
+        std::process::exit(1);
+    }
+    if mode != "tcp" && healthcheck_enabled {
+        eprintln!("--healthcheck is only valid with --mode tcp");
         std::process::exit(1);
     }
 
@@ -326,6 +337,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         self_test(&proxy_addr, &backends).await;
                     });
+                }
+
+                // Spawn SOCKS5 healthcheck if enabled
+                if healthcheck_enabled {
+                    info!("SOCKS5 healthcheck enabled for {} backends", lb.backends().len());
+                    healthcheck::spawn_healthcheck_task(lb.clone());
                 }
 
                 if let Err(e) = proxy.start().await {
