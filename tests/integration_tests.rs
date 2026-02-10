@@ -1,7 +1,7 @@
 use rustproxy::{TcpProxy, HttpProxy, ConnectionCache};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration, timeout};
@@ -76,7 +76,9 @@ async fn test_full_tcp_proxy_integration() {
             tokio::spawn(async move {
                 let cache = ConnectionCache::new(128 * 1024);
                 let active_connections = Arc::new(AtomicUsize::new(0));
-                let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
+                let total_tx = Arc::new(AtomicU64::new(0));
+                let total_rx = Arc::new(AtomicU64::new(0));
+                let _ = TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections, total_tx, total_rx).await;
             });
         }
     });
@@ -138,7 +140,9 @@ async fn test_concurrent_tcp_connections() {
             tokio::spawn(async move {
                 let cache = rustproxy::ConnectionCache::new(128 * 1024);
                 let active_connections = Arc::new(AtomicUsize::new(0));
-                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections).await;
+                let total_tx = Arc::new(AtomicU64::new(0));
+                let total_rx = Arc::new(AtomicU64::new(0));
+                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, target_addr, cache, None, active_connections, total_tx, total_rx).await;
             });
         }
     });
@@ -187,7 +191,9 @@ async fn test_proxy_error_handling() {
             tokio::spawn(async move {
                 let cache = rustproxy::ConnectionCache::new(128 * 1024);
                 let active_connections = Arc::new(AtomicUsize::new(0));
-                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, invalid_target, cache, None, active_connections).await;
+                let total_tx = Arc::new(AtomicU64::new(0));
+                let total_rx = Arc::new(AtomicU64::new(0));
+                let _ = rustproxy::TcpProxy::handle_connection_with_cache(inbound, client_addr, invalid_target, cache, None, active_connections, total_tx, total_rx).await;
             });
         }
     });

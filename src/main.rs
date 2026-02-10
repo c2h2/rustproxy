@@ -1,6 +1,7 @@
 use std::env;
 use std::net::SocketAddr;
-use tracing::{error, info};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 mod tcp_proxy;
 mod http_proxy;
@@ -8,6 +9,8 @@ mod socks5_proxy;
 mod connection_cache;
 pub mod stats;
 pub mod manager;
+mod lb;
+mod web;
 
 #[cfg(test)]
 mod test_utils;
@@ -16,6 +19,7 @@ use tcp_proxy::TcpProxy;
 use http_proxy::HttpProxy;
 use socks5_proxy::Socks5Proxy;
 use connection_cache::parse_cache_size;
+use lb::LbAlgorithm;
 
 fn print_usage() {
     println!("Usage:");
@@ -29,11 +33,14 @@ fn print_usage() {
     println!("Proxy Mode Options:");
     println!("  --listen <address:port>      Address to listen on");
     println!("  --target <address:port>      Address to proxy to (required for tcp mode only)");
+    println!("                               Comma-separated for load balancing (tcp mode)");
     println!("  --mode <tcp|http|socks5>     Proxy mode");
     println!("  --cache-size <size>          Connection cache size (default: 256kb)");
     println!("                               Examples: 0, none, 256kb, 1mb, 8mb");
     println!("  --socks5-auth <user:pass>    SOCKS5 authentication (optional)");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
+    println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
+    println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
     println!();
     println!("Examples:");
     println!("  rustproxy --manager");
@@ -41,6 +48,11 @@ fn print_usage() {
     println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --manager-addr 127.0.0.1:14337");
     println!("  rustproxy --listen 127.0.0.1:8080 --mode http");
     println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5 --socks5-auth user:password");
+    println!();
+    println!("Load Balancing Example:");
+    println!("  rustproxy --listen 127.0.0.1:8080 \\");
+    println!("    --target 192.168.1.100:9000,192.168.1.100:9001,192.168.1.100:9002 \\");
+    println!("    --mode tcp --lb random --http-interface :8888");
     println!();
     println!("Environment Variables:");
     println!("  RUSTPROXY_MANAGER=<addr:port>  Set manager address for stats reporting");
@@ -51,12 +63,21 @@ fn validate_no_self_connection(listen: &str, target: &str) -> Result<(), String>
         .map_err(|_| format!("Invalid listen address: {}", listen))?;
     let target_addr: SocketAddr = target.parse()
         .map_err(|_| format!("Invalid target address: {}", target))?;
-    
+
     if listen_addr == target_addr {
         return Err("Listen and target addresses cannot be the same (self-connection not allowed)".to_string());
     }
-    
+
     Ok(())
+}
+
+/// Normalize bind addresses: `:8888` → `0.0.0.0:8888`
+fn normalize_bind_addr(addr: &str) -> String {
+    if addr.starts_with(':') {
+        format!("0.0.0.0{}", addr)
+    } else {
+        addr.to_string()
+    }
 }
 
 #[tokio::main]
@@ -64,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() < 2 {
         print_usage();
         std::process::exit(1);
@@ -73,13 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check for manager mode first
     if args.contains(&"--manager".to_string()) {
         let mut listen_addr = "127.0.0.1:13337".to_string();
-        
+
         for i in 1..args.len() {
             if args[i] == "--listen" && i + 1 < args.len() {
                 listen_addr = args[i + 1].clone();
             }
         }
-        
+
         info!("Starting RustProxy Manager on {}", listen_addr);
         let manager = manager::Manager::new(&listen_addr);
         return manager.start().await;
@@ -92,6 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cache_size = None;
     let mut socks5_auth = None;
     let mut manager_addr = None;
+    let mut lb_algorithm = None;
+    let mut http_interface = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -144,6 +167,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--lb" => {
+                if i + 1 < args.len() {
+                    lb_algorithm = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--http-interface" => {
+                if i + 1 < args.len() {
+                    http_interface = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 print_usage();
@@ -154,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen = listen_addr.ok_or("Missing --listen parameter")?;
     let mode = mode.ok_or("Missing --mode parameter")?;
-    
+
     // Target is only required for tcp mode
     let target = if mode == "tcp" {
         Some(target_addr.ok_or("Missing --target parameter for tcp mode")?)
@@ -177,12 +216,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Validate no self-connection for tcp mode
+    // Validate --lb and --http-interface are only used with tcp mode
+    if mode != "tcp" && lb_algorithm.is_some() {
+        eprintln!("--lb is only valid with --mode tcp");
+        std::process::exit(1);
+    }
+    if mode != "tcp" && http_interface.is_some() {
+        eprintln!("--http-interface is only valid with --mode tcp");
+        std::process::exit(1);
+    }
+
+    // Validate no self-connection for tcp mode (single target only)
     if mode == "tcp" {
         if let Some(ref target_addr) = target {
-            if let Err(e) = validate_no_self_connection(&listen, target_addr) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+            if !target_addr.contains(',') {
+                if let Err(e) = validate_no_self_connection(&listen, target_addr) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -226,10 +277,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode.as_str() {
         "tcp" => {
             let target = target.unwrap();
-            let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr);
-            if let Err(e) = proxy.start().await {
-                error!("TCP proxy error: {}", e);
-                return Err(e);
+
+            // Determine if we're in load-balancing mode
+            let is_lb_mode = target.contains(',') || lb_algorithm.is_some();
+
+            if is_lb_mode {
+                // Parse LB algorithm (default: roundrobin)
+                let algo = match &lb_algorithm {
+                    Some(s) => match LbAlgorithm::from_str(s) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    None => LbAlgorithm::RoundRobin,
+                };
+
+                let lb = match lb::LoadBalancer::new(&target, algo) {
+                    Ok(lb) => Arc::new(lb),
+                    Err(e) => {
+                        eprintln!("Error creating load balancer: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr);
+
+                // Spawn web interface if configured
+                if let Some(ref iface) = http_interface {
+                    let web_bind = normalize_bind_addr(iface);
+                    let web_state = Arc::new(web::WebState {
+                        lb: lb.clone(),
+                        listen_addr: listen.clone(),
+                        active_connections: proxy.active_connections_ref(),
+                        total_tx_bytes: proxy.total_tx_ref(),
+                        total_rx_bytes: proxy.total_rx_ref(),
+                        start_time: proxy.start_time(),
+                    });
+                    tokio::spawn(web::start_web_interface(web_bind, web_state));
+                }
+
+                // Spawn self-test task
+                {
+                    let proxy_addr = listen.clone();
+                    let backends: Vec<SocketAddr> = lb.backends().iter().map(|b| b.addr).collect();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        self_test(&proxy_addr, &backends).await;
+                    });
+                }
+
+                if let Err(e) = proxy.start().await {
+                    error!("TCP LB proxy error: {}", e);
+                    return Err(e);
+                }
+            } else {
+                // Single-target mode (unchanged)
+                let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr);
+                if let Err(e) = proxy.start().await {
+                    error!("TCP proxy error: {}", e);
+                    return Err(e);
+                }
             }
         }
         "http" => {
@@ -251,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Socks5Proxy::with_stats(&listen, cache_size_bytes, manager_socket_addr)
             };
-            
+
             if let Err(e) = proxy.start().await {
                 error!("SOCKS5 proxy error: {}", e);
                 return Err(e);
@@ -261,4 +370,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Non-fatal self-test: try connecting to proxy and each backend after startup.
+async fn self_test(proxy_addr: &str, backends: &[SocketAddr]) {
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+
+    // Test proxy listener
+    match timeout(Duration::from_secs(5), TcpStream::connect(proxy_addr)).await {
+        Ok(Ok(_)) => info!("[self-test] PASS: proxy listener {} is reachable", proxy_addr),
+        Ok(Err(e)) => warn!("[self-test] FAIL: cannot connect to proxy {}: {}", proxy_addr, e),
+        Err(_) => warn!("[self-test] FAIL: timeout connecting to proxy {}", proxy_addr),
+    }
+
+    // Test each backend
+    for addr in backends {
+        match timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
+            Ok(Ok(_)) => info!("[self-test] PASS: backend {} is reachable", addr),
+            Ok(Err(e)) => warn!("[self-test] WARN: backend {} unreachable: {}", addr, e),
+            Err(_) => warn!("[self-test] WARN: timeout connecting to backend {}", addr),
+        }
+    }
 }

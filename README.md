@@ -5,9 +5,12 @@ A high-performance proxy server written in Rust with configurable connection cac
 ## Features
 
 - **TCP Proxy**: Forward TCP connections to target servers
-- **HTTP Proxy**: Forward HTTP requests to target servers  
+- **TCP Load Balancing**: Distribute connections across multiple backends with round-robin or random algorithms
+- **HTTP Proxy**: Forward HTTP requests to target servers
 - **SOCKS5 Proxy**: Full SOCKS5 server with optional authentication
 - **Connection Caching**: Configurable connection pooling to improve performance
+- **Web Dashboard**: Built-in HAProxy-style dashboard for load balancer monitoring and control
+- **REST API**: Enable/disable backends at runtime via HTTP API
 - **Async/Await**: Built with Tokio for high-performance async networking
 - **Flexible Configuration**: Command-line configuration with sensible defaults
 
@@ -22,17 +25,20 @@ cargo build --release
 ## Usage
 
 ```bash
-rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [--cache-size <size>] [--socks5-auth <user:pass>]
+rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [options]
 ```
 
 ### Options
 
 - `--listen <address:port>` - Address to listen on
-- `--target <address:port>` - Address to proxy requests to (required for tcp mode only)
+- `--target <address:port>` - Address to proxy requests to (required for tcp mode). Comma-separated for load balancing
 - `--mode <tcp|http|socks5>` - Proxy mode
 - `--cache-size <size>` - Connection cache size (default: 256KB)
   - Examples: `0`, `none`, `256kb`, `1mb`, `8mb`
 - `--socks5-auth <user:pass>` - SOCKS5 authentication credentials (optional)
+- `--lb <random|roundrobin>` - Load balancing algorithm (tcp mode, requires multiple targets)
+- `--http-interface <addr:port>` - HTTP dashboard for LB monitoring (e.g. `:8888`)
+- `--manager-addr <addr:port>` - Manager address for stats reporting
 
 ### Examples
 
@@ -49,6 +55,20 @@ rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache
 **TCP Proxy with caching disabled:**
 ```bash
 rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 0
+```
+
+**TCP Load Balancer (round-robin across 3 backends):**
+```bash
+rustproxy --listen 127.0.0.1:8080 \
+  --target 192.168.1.100:9000,192.168.1.100:9001,192.168.1.100:9002 \
+  --mode tcp --lb roundrobin --http-interface :8888
+```
+
+**TCP Load Balancer (random algorithm, 1MB cache):**
+```bash
+rustproxy --listen 127.0.0.1:8080 \
+  --target 10.0.0.1:3000,10.0.0.2:3000,10.0.0.3:3000 \
+  --mode tcp --lb random --cache-size 1mb --http-interface :8888
 ```
 
 **HTTP Proxy (local server, no forwarding):**
@@ -73,11 +93,72 @@ rustproxy --listen 127.0.0.1:1080 --mode socks5 --cache-size 2mb
 
 ## Architecture
 
-- **TCP Proxy** (`src/tcp_proxy.rs`): Handles raw TCP connection forwarding
+- **TCP Proxy** (`src/tcp_proxy.rs`): Handles raw TCP connection forwarding, supports single-target and load-balanced modes
+- **Load Balancer** (`src/lb.rs`): Round-robin and random algorithms, per-backend atomic stats, runtime enable/disable
+- **Web Dashboard** (`src/web.rs`): Axum-based HTTP server serving the LB dashboard and REST API
+- **Dashboard UI** (`static/lb_dashboard.html`): HAProxy-style web interface with auto-refresh
 - **HTTP Proxy** (`src/http_proxy.rs`): Handles HTTP request/response forwarding
 - **SOCKS5 Proxy** (`src/socks5_proxy.rs`): Full SOCKS5 server implementation with authentication support
 - **Connection Cache** (`src/connection_cache.rs`): Manages connection pooling for performance optimization
+- **Stats** (`src/stats.rs`): Per-connection and aggregate statistics with UDP reporting
+- **Manager** (`src/manager.rs`): Central manager dashboard for monitoring all proxy instances
 - **Main** (`src/main.rs`): Command-line interface and application startup
+
+## Load Balancing
+
+When multiple targets are specified (comma-separated), rustproxy operates in load balancing mode, distributing incoming TCP connections across the backends.
+
+### Algorithms
+
+| Algorithm | Flag | Description |
+|-----------|------|-------------|
+| Round Robin | `--lb roundrobin` | Cycles through enabled backends sequentially |
+| Random | `--lb random` | Selects a random enabled backend for each connection |
+
+If `--lb` is not specified but multiple targets are given, round-robin is used by default.
+
+### Web Dashboard
+
+When `--http-interface` is specified, a built-in web dashboard is available with:
+
+- **Summary header**: Listen address, algorithm, uptime, total active connections, aggregate TX/RX
+- **Backend table**: ID, address, status (UP/DISABLED), active connections, total connections, TX, RX, errors
+- **Enable/Disable buttons**: Toggle backends on/off at runtime
+- **Auto-refresh**: Polls `/api/stats` every 2 seconds
+- **Color coding**: Green = enabled, Red = disabled, Yellow = has errors
+
+### REST API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web dashboard |
+| `/api/backends` | GET | JSON list of all backends with algorithm |
+| `/api/backends/:id/enable` | POST | Enable a backend |
+| `/api/backends/:id/disable` | POST | Disable a backend |
+| `/api/stats` | GET | Full stats (uptime, connections, bytes, all backends) |
+| `/api/health` | GET | Health check |
+
+**Example API usage:**
+```bash
+# List backends
+curl http://localhost:8888/api/backends
+
+# Disable backend 1
+curl -X POST http://localhost:8888/api/backends/1/disable
+
+# Re-enable backend 1
+curl -X POST http://localhost:8888/api/backends/1/enable
+
+# Get full stats
+curl http://localhost:8888/api/stats
+```
+
+### Self-Test
+
+On startup in LB mode, rustproxy performs a non-blocking self-test:
+1. Tries connecting to the proxy listener (5s timeout)
+2. Tries connecting to each backend (3s timeout)
+3. Logs PASS/WARN for each — warnings only, does not block startup
 
 ## SOCKS5 Features
 
@@ -143,8 +224,11 @@ cargo bench
 ### Dependencies
 
 - **tokio**: Async runtime
-- **hyper**: HTTP client/server library  
+- **axum**: Web framework (dashboard + REST API)
+- **hyper**: HTTP client/server library
+- **rand**: Random backend selection
 - **tracing**: Structured logging
+- **serde/serde_json**: JSON serialization
 - **bytes**: Byte buffer utilities
 - **futures-util**: Future utilities
 

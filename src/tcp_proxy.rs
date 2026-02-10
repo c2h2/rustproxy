@@ -11,6 +11,7 @@ use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::connection_cache::ConnectionCache;
+use crate::lb::LoadBalancer;
 use crate::stats::StatsCollector;
 
 /* ---------- Optional socket2 for portable TCP keepalive ---------- */
@@ -42,6 +43,9 @@ pub struct TcpProxy {
     // For log context
     start_time: Instant,
     listen_port: Arc<AtomicUsize>, // set after bind()
+
+    // Load balancer (None = single-target mode)
+    lb: Option<Arc<LoadBalancer>>,
 }
 
 impl TcpProxy {
@@ -59,6 +63,7 @@ impl TcpProxy {
             recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
+            lb: None,
         }
     }
 
@@ -82,7 +87,55 @@ impl TcpProxy {
             recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
+            lb: None,
         }
+    }
+
+    pub fn with_lb(
+        bind_addr: &str,
+        lb: Arc<LoadBalancer>,
+        cache_size_bytes: usize,
+        manager_addr: Option<SocketAddr>,
+    ) -> Self {
+        let stats =
+            manager_addr.map(|addr| Arc::new(StatsCollector::new("tcp-lb", bind_addr, Some(addr))));
+        Self {
+            bind_addr: bind_addr.to_string(),
+            target_addr: String::new(), // unused in LB mode
+            cache: ConnectionCache::new(cache_size_bytes),
+            stats,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            max_connections: 10000,
+            total_tx_bytes: Arc::new(AtomicU64::new(0)),
+            total_rx_bytes: Arc::new(AtomicU64::new(0)),
+            recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
+            start_time: Instant::now(),
+            listen_port: Arc::new(AtomicUsize::new(0)),
+            lb: Some(lb),
+        }
+    }
+
+    /* ---------- Accessors for WebState sharing ---------- */
+
+    pub fn active_connections_ref(&self) -> Arc<AtomicUsize> {
+        self.active_connections.clone()
+    }
+
+    pub fn total_tx_ref(&self) -> Arc<AtomicU64> {
+        self.total_tx_bytes.clone()
+    }
+
+    pub fn total_rx_ref(&self) -> Arc<AtomicU64> {
+        self.total_rx_bytes.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn load_balancer(&self) -> Option<Arc<LoadBalancer>> {
+        self.lb.clone()
+    }
+
+    pub fn start_time(&self) -> Instant {
+        self.start_time
     }
 
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -92,14 +145,27 @@ impl TcpProxy {
             .store(local_addr.port() as usize, Ordering::Relaxed);
 
         let (current_cache, max_cache) = self.cache.get_cache_stats().await;
-        info!(
-            "TCP proxy listening on {} -> {} (cache: {}/{}KB, max connections: {})",
-            local_addr,
-            self.target_addr,
-            current_cache / 1024,
-            max_cache / 1024,
-            self.max_connections
-        );
+        if let Some(ref lb) = self.lb {
+            let backends: Vec<String> = lb.backends().iter().map(|b| b.addr.to_string()).collect();
+            info!(
+                "TCP LB proxy listening on {} -> [{}] ({} algo, cache: {}/{}KB, max connections: {})",
+                local_addr,
+                backends.join(", "),
+                lb.algorithm().as_str(),
+                current_cache / 1024,
+                max_cache / 1024,
+                self.max_connections
+            );
+        } else {
+            info!(
+                "TCP proxy listening on {} -> {} (cache: {}/{}KB, max connections: {})",
+                local_addr,
+                self.target_addr,
+                current_cache / 1024,
+                max_cache / 1024,
+                self.max_connections
+            );
+        }
 
         // Start stats reporting if enabled
         if let Some(stats) = &self.stats {
@@ -132,7 +198,20 @@ impl TcpProxy {
                         });
                     }
 
-                    let target_addr = self.target_addr.clone();
+                    // Resolve target: either from LB or fixed single target
+                    let (target_addr, backend) = if let Some(ref lb) = self.lb {
+                        match lb.next_backend() {
+                            Some(b) => (b.addr.to_string(), Some(b)),
+                            None => {
+                                warn!("All backends disabled, rejecting connection from {}", client_addr);
+                                drop(inbound);
+                                continue;
+                            }
+                        }
+                    } else {
+                        (self.target_addr.clone(), None)
+                    };
+
                     let cache = self.cache.clone();
                     let stats = self.stats.clone();
                     let active_connections = self.active_connections.clone();
@@ -141,8 +220,14 @@ impl TcpProxy {
 
                     active_connections.fetch_add(1, Ordering::Relaxed);
 
+                    // Per-backend stats: increment active + total connections
+                    if let Some(ref b) = backend {
+                        b.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                        b.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                    }
+
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection_with_cache(
+                        let result = Self::handle_connection_with_cache(
                             inbound,
                             client_addr,
                             target_addr,
@@ -152,8 +237,23 @@ impl TcpProxy {
                             total_tx_bytes,
                             total_rx_bytes,
                         )
-                        .await
-                        {
+                        .await;
+
+                        // Update per-backend stats
+                        if let Some(ref b) = backend {
+                            match &result {
+                                Ok((tx, rx)) => {
+                                    b.stats.total_tx_bytes.fetch_add(*tx, Ordering::Relaxed);
+                                    b.stats.total_rx_bytes.fetch_add(*rx, Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                        }
+
+                        if let Err(e) = result {
                             error!("Error handling connection from {}: {}", client_addr, e);
                         }
                         active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -235,7 +335,7 @@ impl TcpProxy {
         _active_connections: Arc<AtomicUsize>,
         total_tx_bytes: Arc<AtomicU64>,
         total_rx_bytes: Arc<AtomicU64>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
         // Create stats connection ID if stats are enabled
         let conn_id = if let Some(ref stats) = stats {
             Some(stats.new_connection(client_addr, target_addr.clone()).await)
@@ -333,7 +433,7 @@ impl TcpProxy {
             stats.close_connection(conn_id).await;
         }
 
-        Ok(())
+        Ok((bytes_to_server, bytes_to_client))
     }
 }
 

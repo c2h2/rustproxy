@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustProxy Load Balancer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes pulse-glow {
+            0%, 100% { box-shadow: 0 0 5px rgba(34, 197, 94, 0.5); }
+            50% { box-shadow: 0 0 20px rgba(34, 197, 94, 0.8); }
+        }
+        .active-glow { animation: pulse-glow 2s ease-in-out infinite; }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8 max-w-6xl">
+
+        <!-- Header -->
+        <div class="mb-8 flex items-center justify-between">
+            <div>
+                <h1 class="text-3xl font-bold text-green-400">RustProxy Load Balancer</h1>
+                <p class="text-gray-400 mt-1" id="subtitle">Initializing...</p>
+            </div>
+            <div id="health-badge" class="px-3 py-1 rounded-full text-sm font-medium bg-gray-700 text-gray-400">
+                Connecting...
+            </div>
+        </div>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Listen</p>
+                <p id="listen-addr" class="text-lg font-bold text-white mt-1 truncate">-</p>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Algorithm</p>
+                <p id="algorithm" class="text-lg font-bold text-blue-400 mt-1">-</p>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Uptime</p>
+                <p id="uptime" class="text-lg font-bold text-white mt-1">-</p>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Active Conns</p>
+                <p id="active-conns" class="text-lg font-bold text-green-400 mt-1">0</p>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Traffic TX / RX</p>
+                <p id="traffic" class="text-lg font-bold text-white mt-1">0 / 0</p>
+            </div>
+        </div>
+
+        <!-- Backend Table -->
+        <div class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+            <div class="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
+                <h2 class="text-xl font-bold">Backends</h2>
+                <span id="backend-count" class="text-gray-400 text-sm">0 backends</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full">
+                    <thead class="bg-gray-900">
+                        <tr>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">ID</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Address</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Status</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Active</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Total Conns</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">TX</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">RX</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Errors</th>
+                            <th class="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase tracking-wider">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="backend-tbody" class="divide-y divide-gray-700">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="mt-4 text-center text-gray-600 text-xs">
+            Auto-refreshing every 2s &mdash; RustProxy Load Balancer Dashboard
+        </div>
+    </div>
+
+    <script>
+        const POLL_INTERVAL = 2000;
+
+        function formatBytes(b) {
+            if (b === 0) return '0 B';
+            const k = 1024;
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(b) / Math.log(k));
+            return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + units[i];
+        }
+
+        function formatUptime(secs) {
+            const d = Math.floor(secs / 86400);
+            const h = Math.floor((secs % 86400) / 3600);
+            const m = Math.floor((secs % 3600) / 60);
+            const s = secs % 60;
+            if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+            if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
+            if (m > 0) return m + 'm ' + s + 's';
+            return s + 's';
+        }
+
+        async function toggleBackend(id, enable) {
+            const action = enable ? 'enable' : 'disable';
+            try {
+                const res = await fetch('/api/backends/' + id + '/' + action, { method: 'POST' });
+                const data = await res.json();
+                if (!data.ok) alert(data.message);
+                await refresh();
+            } catch (e) {
+                console.error('Toggle failed:', e);
+            }
+        }
+
+        function renderBackends(backends) {
+            const tbody = document.getElementById('backend-tbody');
+            tbody.innerHTML = '';
+            backends.forEach(b => {
+                const hasErrors = b.total_errors > 0;
+                const statusColor = b.enabled
+                    ? (hasErrors ? 'bg-yellow-500' : 'bg-green-500')
+                    : 'bg-red-500';
+                const statusText = b.enabled ? 'UP' : 'DISABLED';
+                const statusBadge = b.enabled
+                    ? (hasErrors
+                        ? 'bg-yellow-900 text-yellow-200'
+                        : 'bg-green-900 text-green-200')
+                    : 'bg-red-900 text-red-200';
+                const btnLabel = b.enabled ? 'Disable' : 'Enable';
+                const btnClass = b.enabled
+                    ? 'bg-red-600 hover:bg-red-700'
+                    : 'bg-green-600 hover:bg-green-700';
+
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-gray-700/50 transition-colors';
+                tr.innerHTML = `
+                    <td class="px-4 py-3 text-sm font-mono">${b.id}</td>
+                    <td class="px-4 py-3 text-sm font-mono">${b.addr}</td>
+                    <td class="px-4 py-3">
+                        <span class="inline-flex items-center gap-1.5">
+                            <span class="inline-block w-2.5 h-2.5 rounded-full ${statusColor} ${b.enabled && !hasErrors ? 'active-glow' : ''}"></span>
+                            <span class="px-2 py-0.5 text-xs rounded-full font-medium ${statusBadge}">${statusText}</span>
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-right">${b.active_connections}</td>
+                    <td class="px-4 py-3 text-sm text-right">${b.total_connections}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatBytes(b.total_tx_bytes)}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatBytes(b.total_rx_bytes)}</td>
+                    <td class="px-4 py-3 text-sm text-right ${hasErrors ? 'text-yellow-400 font-medium' : ''}">${b.total_errors}</td>
+                    <td class="px-4 py-3 text-center">
+                        <button onclick="toggleBackend(${b.id}, ${!b.enabled})"
+                            class="px-3 py-1 text-xs font-medium rounded text-white ${btnClass} transition-colors">
+                            ${btnLabel}
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function refresh() {
+            try {
+                const res = await fetch('/api/stats');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+
+                document.getElementById('subtitle').textContent =
+                    data.listen_addr + ' \u2014 ' + data.algorithm + ' \u2014 ' + data.backends.length + ' backends';
+                document.getElementById('listen-addr').textContent = data.listen_addr;
+                document.getElementById('algorithm').textContent = data.algorithm;
+                document.getElementById('uptime').textContent = formatUptime(data.uptime_secs);
+                document.getElementById('active-conns').textContent = data.active_connections;
+                document.getElementById('traffic').textContent =
+                    formatBytes(data.total_tx_bytes) + ' / ' + formatBytes(data.total_rx_bytes);
+                document.getElementById('backend-count').textContent =
+                    data.backends.length + ' backend' + (data.backends.length !== 1 ? 's' : '');
+
+                const badge = document.getElementById('health-badge');
+                badge.textContent = 'Healthy';
+                badge.className = 'px-3 py-1 rounded-full text-sm font-medium bg-green-900 text-green-200';
+
+                renderBackends(data.backends);
+            } catch (e) {
+                console.error('Refresh failed:', e);
+                const badge = document.getElementById('health-badge');
+                badge.textContent = 'Error';
+                badge.className = 'px-3 py-1 rounded-full text-sm font-medium bg-red-900 text-red-200';
+            }
+        }
+
+        // Initial fetch + polling
+        refresh();
+        setInterval(refresh, POLL_INTERVAL);
+    </script>
+</body>
+</html>
