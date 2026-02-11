@@ -95,7 +95,7 @@
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">TX</th>
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">RX</th>
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Errors</th>
-                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">HC Time</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">HTTP Ping</th>
                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Last Check</th>
                             <th class="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase tracking-wider">Action</th>
                         </tr>
@@ -185,7 +185,7 @@
                 const statusColor = b.enabled
                     ? (hasErrors ? 'bg-yellow-500' : 'bg-green-500')
                     : 'bg-red-500';
-                const statusText = b.enabled ? 'UP' : (hcFail ? 'HC FAIL' : 'DISABLED');
+                const statusText = b.enabled ? 'UP' : (hcFail ? 'PING FAIL' : 'DISABLED');
                 const statusBadge = b.enabled
                     ? (hasErrors
                         ? 'bg-yellow-900 text-yellow-200'

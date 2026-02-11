@@ -47,8 +47,8 @@ fn print_usage() {
     println!("  --buffer-size <size>          Server→client relay buffer (default: 16mb)");
     println!("                               Decouples fast server reads from slow client writes");
     println!("                               Examples: 256kb, 16mb, 64mb");
-    println!("  --healthcheck                Enable SOCKS5 healthcheck for TCP LB backends");
-    println!("                               Probes each backend via SOCKS5 CONNECT every 60s");
+    println!("  --healthcheck                Enable HTTP ping healthcheck for TCP LB backends");
+    println!("                               Probes each backend via direct HTTP GET every 60s");
     println!("                               Disables failing backends; re-enables on recovery");
     println!("                               Safety valve: re-enables all if every backend fails");
     println!();
@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_addr
     };
 
-    // Default to 256KB cache if not specified
+    // Default to 64MB cache if not specified
     let cache_size_str = cache_size.unwrap_or_else(|| "64mb".to_string());
     let cache_size_bytes = match parse_cache_size(&cache_size_str) {
         Ok(size) => size,
@@ -406,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Spawn SOCKS5 healthcheck if enabled
                 if healthcheck_enabled {
-                    info!("SOCKS5 healthcheck enabled for {} backends", lb.backends().len());
+                    info!("HTTP ping healthcheck enabled for {} backends", lb.backends().len());
                     healthcheck::spawn_healthcheck_task(lb.clone());
                 }
 

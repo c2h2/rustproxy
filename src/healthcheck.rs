@@ -9,101 +9,37 @@ use tracing::{info, warn};
 
 use crate::lb::LoadBalancer;
 
-/// Result of a single SOCKS5 healthcheck probe.
+/// Result of a single healthcheck probe.
 enum HealthCheckResult {
     Ok(u64),       // response time in ms
     Error(String), // error message
     Timeout,       // overall 10s timeout exceeded
 }
 
-/// Perform a SOCKS5 healthcheck against a proxy backend.
+/// Perform an HTTP ping healthcheck against a backend.
 ///
-/// Connects to `proxy_addr`, performs a SOCKS5 handshake to CONNECT to
-/// `google.com:80`, sends an HTTP GET, and verifies the response starts
-/// with `HTTP/`. The entire operation is wrapped in a 10s timeout.
-async fn check_socks5_backend(proxy_addr: &str) -> HealthCheckResult {
+/// Connects directly to `backend_addr`, sends a minimal HTTP GET, and
+/// verifies the response starts with `HTTP/`. The entire operation is
+/// wrapped in a 10s timeout.
+async fn check_http_backend(backend_addr: &str) -> HealthCheckResult {
     let result = timeout(Duration::from_secs(10), async {
         let start = Instant::now();
 
-        // 1. TCP connect to the SOCKS5 proxy
-        let mut stream = TcpStream::connect(proxy_addr).await.map_err(|e| {
+        // 1. TCP connect to the backend
+        let mut stream = TcpStream::connect(backend_addr).await.map_err(|e| {
             format!("TCP connect failed: {}", e)
         })?;
 
-        // 2. SOCKS5 greeting: version=5, 1 auth method, no-auth=0
-        stream.write_all(&[0x05, 0x01, 0x00]).await.map_err(|e| {
-            format!("greeting write failed: {}", e)
-        })?;
-
-        let mut resp = [0u8; 2];
-        stream.read_exact(&mut resp).await.map_err(|e| {
-            format!("greeting read failed: {}", e)
-        })?;
-        if resp[0] != 0x05 || resp[1] != 0x00 {
-            return Err(format!("bad greeting response: {:02x}{:02x}", resp[0], resp[1]));
-        }
-
-        // 3. SOCKS5 CONNECT to google.com:80
-        //    [VER=05, CMD=01(connect), RSV=00, ATYP=03(domain), LEN=0a, "google.com", PORT=0050]
-        let domain = b"google.com";
-        let mut connect_req = Vec::with_capacity(4 + 1 + domain.len() + 2);
-        connect_req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03]);
-        connect_req.push(domain.len() as u8);
-        connect_req.extend_from_slice(domain);
-        connect_req.extend_from_slice(&[0x00, 0x50]); // port 80
-        stream.write_all(&connect_req).await.map_err(|e| {
-            format!("connect request write failed: {}", e)
-        })?;
-
-        // 4. Read SOCKS5 CONNECT response
-        //    [VER, REP, RSV, ATYP, BND.ADDR..., BND.PORT(2)]
-        let mut hdr = [0u8; 4];
-        stream.read_exact(&mut hdr).await.map_err(|e| {
-            format!("connect response read failed: {}", e)
-        })?;
-        if hdr[1] != 0x00 {
-            return Err(format!("SOCKS5 CONNECT failed with rep={:02x}", hdr[1]));
-        }
-
-        // Drain bound address based on ATYP
-        match hdr[3] {
-            0x01 => {
-                // IPv4: 4 bytes addr + 2 bytes port
-                let mut buf = [0u8; 6];
-                stream.read_exact(&mut buf).await.map_err(|e| {
-                    format!("drain IPv4 addr failed: {}", e)
-                })?;
-            }
-            0x03 => {
-                // Domain: 1 byte len + domain + 2 bytes port
-                let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf).await.map_err(|e| {
-                    format!("drain domain len failed: {}", e)
-                })?;
-                let mut buf = vec![0u8; len_buf[0] as usize + 2];
-                stream.read_exact(&mut buf).await.map_err(|e| {
-                    format!("drain domain addr failed: {}", e)
-                })?;
-            }
-            0x04 => {
-                // IPv6: 16 bytes addr + 2 bytes port
-                let mut buf = [0u8; 18];
-                stream.read_exact(&mut buf).await.map_err(|e| {
-                    format!("drain IPv6 addr failed: {}", e)
-                })?;
-            }
-            other => {
-                return Err(format!("unknown ATYP {:02x}", other));
-            }
-        }
-
-        // 5. Send HTTP GET through the tunnel
-        let http_req = b"GET / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n";
-        stream.write_all(http_req).await.map_err(|e| {
+        // 2. Send minimal HTTP GET
+        let http_req = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            backend_addr
+        );
+        stream.write_all(http_req.as_bytes()).await.map_err(|e| {
             format!("HTTP request write failed: {}", e)
         })?;
 
-        // 6. Read enough to verify HTTP response
+        // 3. Read enough to verify HTTP response
         let mut resp_buf = [0u8; 128];
         let n = stream.read(&mut resp_buf).await.map_err(|e| {
             format!("HTTP response read failed: {}", e)
@@ -135,7 +71,7 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
     tokio::spawn(async move {
         // Initial delay to let everything start up
         tokio::time::sleep(Duration::from_secs(5)).await;
-        info!("[healthcheck] Starting SOCKS5 healthcheck loop (interval=60s)");
+        info!("[healthcheck] Starting HTTP ping healthcheck loop (interval=60s)");
 
         loop {
             let backends = lb.backends();
@@ -145,7 +81,7 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
             for backend in backends.iter() {
                 let addr = backend.addr.to_string();
                 handles.push(tokio::spawn(async move {
-                    let result = check_socks5_backend(&addr).await;
+                    let result = check_http_backend(&addr).await;
                     (result, addr)
                 }));
             }
