@@ -31,6 +31,7 @@ pub struct Socks5Proxy {
     username: Option<String>,
     password: Option<String>,
     stats: Option<Arc<StatsCollector>>,
+    buffer_size: usize,
 }
 
 #[derive(Debug)]
@@ -42,7 +43,7 @@ struct Socks5Request {
 
 impl Socks5Proxy {
     #[allow(dead_code)]
-    pub fn new(bind_addr: &str, cache_size_bytes: usize) -> Self {
+    pub fn new(bind_addr: &str, cache_size_bytes: usize, buffer_size: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
@@ -50,11 +51,12 @@ impl Socks5Proxy {
             username: None,
             password: None,
             stats: None,
+            buffer_size,
         }
     }
 
     #[allow(dead_code)]
-    pub fn with_auth(bind_addr: &str, cache_size_bytes: usize, username: String, password: String) -> Self {
+    pub fn with_auth(bind_addr: &str, cache_size_bytes: usize, username: String, password: String, buffer_size: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
@@ -62,14 +64,15 @@ impl Socks5Proxy {
             username: Some(username),
             password: Some(password),
             stats: None,
+            buffer_size,
         }
     }
-    
-    pub fn with_stats(bind_addr: &str, cache_size_bytes: usize, manager_addr: Option<SocketAddr>) -> Self {
+
+    pub fn with_stats(bind_addr: &str, cache_size_bytes: usize, manager_addr: Option<SocketAddr>, buffer_size: usize) -> Self {
         let stats = manager_addr.map(|addr| {
             Arc::new(StatsCollector::new("socks5", bind_addr, Some(addr)))
         });
-        
+
         Self {
             bind_addr: bind_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
@@ -77,14 +80,15 @@ impl Socks5Proxy {
             username: None,
             password: None,
             stats,
+            buffer_size,
         }
     }
-    
-    pub fn with_auth_and_stats(bind_addr: &str, cache_size_bytes: usize, username: String, password: String, manager_addr: Option<SocketAddr>) -> Self {
+
+    pub fn with_auth_and_stats(bind_addr: &str, cache_size_bytes: usize, username: String, password: String, manager_addr: Option<SocketAddr>, buffer_size: usize) -> Self {
         let stats = manager_addr.map(|addr| {
             Arc::new(StatsCollector::new("socks5", bind_addr, Some(addr)))
         });
-        
+
         Self {
             bind_addr: bind_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
@@ -92,6 +96,7 @@ impl Socks5Proxy {
             username: Some(username),
             password: Some(password),
             stats,
+            buffer_size,
         }
     }
 
@@ -377,12 +382,21 @@ impl Socks5Proxy {
         let (mut client_read, mut client_write) = client_stream.into_split();
         let (mut target_read, mut target_write) = target_stream.into_split();
 
+        // Client→Target: direct copy (no buffering needed)
         let client_to_target = tokio::io::copy(&mut client_read, &mut target_write);
-        let target_to_client = tokio::io::copy(&mut target_read, &mut client_write);
 
-        // Use join instead of try_join to capture partial byte counts even on failures
-        let (result1, result2) = tokio::join!(client_to_target, target_to_client);
-        
+        // Target→Client: buffered via duplex pipe so reads from target
+        // are decoupled from slow client writes
+        let buffer_size = self.buffer_size;
+        let (mut duplex_w, mut duplex_r) = tokio::io::duplex(buffer_size);
+        let t2buf = tokio::spawn(async move {
+            tokio::io::copy(&mut target_read, &mut duplex_w).await
+        });
+        let buf2c = tokio::io::copy(&mut duplex_r, &mut client_write);
+
+        // Use join to capture partial byte counts even on failures
+        let (result1, r_t2buf, r_buf2c) = tokio::join!(client_to_target, t2buf, buf2c);
+
         // Extract byte counts from results, defaulting to 0 on error
         let bytes_to_target = match &result1 {
             Ok(bytes) => *bytes,
@@ -391,19 +405,24 @@ impl Socks5Proxy {
                 0
             }
         };
-        let bytes_to_client = match &result2 {
+        if let Err(e) = &r_t2buf {
+            debug!("Target->Buffer task error for {}: {}", client_addr, e);
+        } else if let Ok(Err(e)) = &r_t2buf {
+            debug!("Target->Buffer copy error for {}: {}", client_addr, e);
+        }
+        let bytes_to_client = match &r_buf2c {
             Ok(bytes) => *bytes,
             Err(e2) => {
-                debug!("Target-to-client copy error for {}: {}", client_addr, e2);
+                debug!("Buffer-to-client copy error for {}: {}", client_addr, e2);
                 0
             }
         };
-        
+
         info!(
             "SOCKS5 connection {} closed. Transferred {} bytes to target, {} bytes to client",
             client_addr, bytes_to_target, bytes_to_client
         );
-        
+
         // Update stats with actual bytes transferred (even if partial)
         if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
             stats.update_connection(conn_id, bytes_to_target, bytes_to_client).await;
@@ -429,7 +448,7 @@ mod tests {
         
         tokio::spawn(mock_server.echo_server());
 
-        let proxy = Socks5Proxy::new("127.0.0.1:0", 128 * 1024);
+        let proxy = Socks5Proxy::new("127.0.0.1:0", 128 * 1024, 16 * 1024 * 1024);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -493,7 +512,7 @@ mod tests {
         
         tokio::spawn(mock_server.echo_server());
 
-        let proxy = Socks5Proxy::with_auth("127.0.0.1:0", 128 * 1024, "testuser".to_string(), "testpass".to_string());
+        let proxy = Socks5Proxy::with_auth("127.0.0.1:0", 128 * 1024, "testuser".to_string(), "testpass".to_string(), 16 * 1024 * 1024);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 

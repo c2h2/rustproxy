@@ -46,11 +46,14 @@ pub struct TcpProxy {
 
     // Load balancer (None = single-target mode)
     lb: Option<Arc<LoadBalancer>>,
+
+    // Server→client relay buffer size (duplex pipe capacity)
+    buffer_size: usize,
 }
 
 impl TcpProxy {
     #[allow(dead_code)]
-    pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize, max_connections: usize) -> Self {
+    pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize, max_connections: usize, buffer_size: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
             target_addr: target_addr.to_string(),
@@ -64,6 +67,7 @@ impl TcpProxy {
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: None,
+            buffer_size,
         }
     }
 
@@ -73,6 +77,7 @@ impl TcpProxy {
         cache_size_bytes: usize,
         manager_addr: Option<SocketAddr>,
         max_connections: usize,
+        buffer_size: usize,
     ) -> Self {
         let stats =
             manager_addr.map(|addr| Arc::new(StatsCollector::new("tcp", bind_addr, Some(addr))));
@@ -89,6 +94,7 @@ impl TcpProxy {
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: None,
+            buffer_size,
         }
     }
 
@@ -98,6 +104,7 @@ impl TcpProxy {
         cache_size_bytes: usize,
         manager_addr: Option<SocketAddr>,
         max_connections: usize,
+        buffer_size: usize,
     ) -> Self {
         let stats =
             manager_addr.map(|addr| Arc::new(StatsCollector::new("tcp-lb", bind_addr, Some(addr))));
@@ -114,6 +121,7 @@ impl TcpProxy {
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: Some(lb),
+            buffer_size,
         }
     }
 
@@ -223,6 +231,7 @@ impl TcpProxy {
                     let active_connections = self.active_connections.clone();
                     let total_tx_bytes = self.total_tx_bytes.clone();
                     let total_rx_bytes = self.total_rx_bytes.clone();
+                    let buffer_size = self.buffer_size;
 
                     active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -242,6 +251,7 @@ impl TcpProxy {
                             active_connections.clone(),
                             total_tx_bytes,
                             total_rx_bytes,
+                            buffer_size,
                         )
                         .await;
 
@@ -333,7 +343,7 @@ impl TcpProxy {
     }
 
     pub async fn handle_connection_with_cache(
-        mut inbound: TcpStream,
+        inbound: TcpStream,
         client_addr: SocketAddr,
         target_addr: String,
         cache: ConnectionCache,
@@ -341,6 +351,7 @@ impl TcpProxy {
         _active_connections: Arc<AtomicUsize>,
         total_tx_bytes: Arc<AtomicU64>,
         total_rx_bytes: Arc<AtomicU64>,
+        buffer_size: usize,
     ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
         // Create stats connection ID if stats are enabled
         let conn_id = if let Some(ref stats) = stats {
@@ -350,7 +361,7 @@ impl TcpProxy {
         };
 
         // Get or create outbound
-        let mut outbound = match cache.get_connection(&target_addr).await {
+        let outbound = match cache.get_connection(&target_addr).await {
             Some(conn) => {
                 debug!("Using cached connection for {} -> {}", client_addr, target_addr);
                 conn
@@ -391,20 +402,33 @@ impl TcpProxy {
 
         info!("Proxying connection from {} to {}", client_addr, target_addr);
 
-        // Split and pump both directions
-        let (ri, wi) = inbound.split();
-        let (ro, wo) = outbound.split();
+        // Split and pump both directions (owned halves for tokio::spawn)
+        let (ri, wi) = inbound.into_split();
+        let (ro, wo) = outbound.into_split();
 
-        let c2s = pump(ri, wo); // client -> server
-        let s2c = pump(ro, wi); // server -> client
+        // Client→Server: direct pump (no buffering needed)
+        let c2s = pump(ri, wo);
 
-        let (r1, r2) = tokio::join!(c2s, s2c);
+        // Server→Client: buffered via duplex pipe so reads from server
+        // are decoupled from slow client writes
+        let (duplex_w, duplex_r) = tokio::io::duplex(buffer_size);
+        let s2buf = tokio::spawn(async move { pump(ro, duplex_w).await });
+        let buf2c = pump(duplex_r, wi);
+
+        let (r1, r_s2buf, r_buf2c) = tokio::join!(c2s, s2buf, buf2c);
 
         let (bytes_to_server, e1_opt) = match r1 {
             Ok(n) => (n, None),
             Err(pe) => (pe.bytes, Some(pe.source)),
         };
-        let (bytes_to_client, e2_opt) = match r2 {
+        // s2buf gives bytes read from server (written into duplex)
+        let (_bytes_into_buf, e_s2buf) = match r_s2buf {
+            Ok(Ok(n)) => (n, None),
+            Ok(Err(pe)) => (pe.bytes, Some(pe.source)),
+            Err(je) => (0, Some(io::Error::new(io::ErrorKind::Other, je))),
+        };
+        // buf2c gives bytes delivered to client
+        let (bytes_to_client, e_buf2c) = match r_buf2c {
             Ok(n) => (n, None),
             Err(pe) => (pe.bytes, Some(pe.source)),
         };
@@ -415,9 +439,15 @@ impl TcpProxy {
                 bytes_to_server, client_addr, e
             );
         }
-        if let Some(e) = e2_opt {
+        if let Some(e) = e_s2buf {
             debug!(
-                "Server->Client ended with error after {} bytes for {}: {}",
+                "Server->Buffer ended with error for {}: {}",
+                client_addr, e
+            );
+        }
+        if let Some(e) = e_buf2c {
+            debug!(
+                "Buffer->Client ended with error after {} bytes for {}: {}",
                 bytes_to_client, client_addr, e
             );
         }
@@ -470,7 +500,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; 256 * 1024];
     let mut total: u64 = 0;
 
     loop {
@@ -515,7 +545,7 @@ mod tests {
         let target_addr = mock_server.addr();
         tokio::spawn(mock_server.echo_server());
 
-        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024, 10000);
+        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024, 10000, 16 * 1024 * 1024);
         // Use start() loop pattern from original tests: we emulate acceptor here
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
@@ -538,6 +568,7 @@ mod tests {
                             active,
                             total_tx,
                             total_rx,
+                            16 * 1024 * 1024,
                         )
                         .await;
                     });
@@ -588,6 +619,7 @@ mod tests {
                             active,
                             total_tx,
                             total_rx,
+                            16 * 1024 * 1024,
                         )
                         .await;
                     });
@@ -643,6 +675,7 @@ mod tests {
                             active,
                             total_tx,
                             total_rx,
+                            16 * 1024 * 1024,
                         )
                         .await;
                     });

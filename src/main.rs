@@ -37,13 +37,16 @@ fn print_usage() {
     println!("  --target <address:port>      Address to proxy to (required for tcp mode only)");
     println!("                               Comma-separated for load balancing (tcp mode)");
     println!("  --mode <tcp|http|socks5>     Proxy mode");
-    println!("  --cache-size <size>          Connection cache size (default: 256kb)");
+    println!("  --cache-size <size>          Connection cache size (default: 64mb)");
     println!("                               Examples: 0, none, 256kb, 1mb, 8mb");
     println!("  --socks5-auth <user:pass>    SOCKS5 authentication (optional)");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
     println!("  --traffic-log <path>         CSV file for persistent traffic history (default: ./rustproxy_traffic.csv)");
+    println!("  --buffer-size <size>          Server→client relay buffer (default: 16mb)");
+    println!("                               Decouples fast server reads from slow client writes");
+    println!("                               Examples: 256kb, 16mb, 64mb");
     println!("  --healthcheck                Enable SOCKS5 healthcheck for TCP LB backends");
     println!("                               Probes each backend via SOCKS5 CONNECT every 60s");
     println!("                               Disables failing backends; re-enables on recovery");
@@ -142,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut http_interface = None;
     let mut healthcheck_enabled = false;
     let mut traffic_log_path = String::from("./rustproxy_traffic.csv");
+    let mut buffer_size_str = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -218,6 +222,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--buffer-size" => {
+                if i + 1 < args.len() {
+                    buffer_size_str = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             "--healthcheck" => {
                 healthcheck_enabled = true;
                 i += 1;
@@ -241,11 +253,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Default to 256KB cache if not specified
-    let cache_size_str = cache_size.unwrap_or_else(|| "256kb".to_string());
+    let cache_size_str = cache_size.unwrap_or_else(|| "64mb".to_string());
     let cache_size_bytes = match parse_cache_size(&cache_size_str) {
         Ok(size) => size,
         Err(e) => {
             eprintln!("Error parsing cache size: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let buffer_size_val = buffer_size_str.unwrap_or_else(|| "16mb".to_string());
+    let buffer_size_bytes = match parse_cache_size(&buffer_size_val) {
+        Ok(size) => size,
+        Err(e) => {
+            eprintln!("Error parsing buffer size: {}", e);
             std::process::exit(1);
         }
     };
@@ -345,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections);
+                let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
 
                 // Load persistent traffic log
                 let tlog = Arc::new(traffic_log::TrafficLog::load(std::path::Path::new(&traffic_log_path)));
@@ -395,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // Single-target mode (unchanged)
-                let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr, max_connections);
+                let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
                 if let Err(e) = proxy.start().await {
                     error!("TCP proxy error: {}", e);
                     return Err(e);
@@ -417,9 +438,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("SOCKS5 auth must be in format 'username:password'");
                     std::process::exit(1);
                 }
-                Socks5Proxy::with_auth_and_stats(&listen, cache_size_bytes, parts[0].to_string(), parts[1].to_string(), manager_socket_addr)
+                Socks5Proxy::with_auth_and_stats(&listen, cache_size_bytes, parts[0].to_string(), parts[1].to_string(), manager_socket_addr, buffer_size_bytes)
             } else {
-                Socks5Proxy::with_stats(&listen, cache_size_bytes, manager_socket_addr)
+                Socks5Proxy::with_stats(&listen, cache_size_bytes, manager_socket_addr, buffer_size_bytes)
             };
 
             if let Err(e) = proxy.start().await {
