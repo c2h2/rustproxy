@@ -22,6 +22,7 @@ pub struct WebState {
     pub total_tx_bytes: Arc<AtomicU64>,
     pub total_rx_bytes: Arc<AtomicU64>,
     pub start_time: Instant,
+    pub max_connections: usize,
 }
 
 /* ------------------------------ JSON types ------------------------------ */
@@ -38,6 +39,7 @@ struct StatsResponse {
     algorithm: String,
     uptime_secs: u64,
     active_connections: usize,
+    max_connections: usize,
     total_tx_bytes: u64,
     total_rx_bytes: u64,
     backends: Vec<crate::lb::BackendSnapshot>,
@@ -75,6 +77,7 @@ async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         algorithm: state.lb.algorithm().as_str().to_string(),
         uptime_secs: uptime,
         active_connections: state.active_connections.load(Ordering::Relaxed),
+        max_connections: state.max_connections,
         total_tx_bytes: state.total_tx_bytes.load(Ordering::Relaxed),
         total_rx_bytes: state.total_rx_bytes.load(Ordering::Relaxed),
         backends: state.lb.snapshot(),

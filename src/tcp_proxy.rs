@@ -50,14 +50,14 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     #[allow(dead_code)]
-    pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize) -> Self {
+    pub fn new(bind_addr: &str, target_addr: &str, cache_size_bytes: usize, max_connections: usize) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
             target_addr: target_addr.to_string(),
             cache: ConnectionCache::new(cache_size_bytes),
             stats: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections: 10000,
+            max_connections,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
             recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
@@ -72,6 +72,7 @@ impl TcpProxy {
         target_addr: &str,
         cache_size_bytes: usize,
         manager_addr: Option<SocketAddr>,
+        max_connections: usize,
     ) -> Self {
         let stats =
             manager_addr.map(|addr| Arc::new(StatsCollector::new("tcp", bind_addr, Some(addr))));
@@ -81,7 +82,7 @@ impl TcpProxy {
             cache: ConnectionCache::new(cache_size_bytes),
             stats,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections: 10000,
+            max_connections,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
             recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
@@ -96,6 +97,7 @@ impl TcpProxy {
         lb: Arc<LoadBalancer>,
         cache_size_bytes: usize,
         manager_addr: Option<SocketAddr>,
+        max_connections: usize,
     ) -> Self {
         let stats =
             manager_addr.map(|addr| Arc::new(StatsCollector::new("tcp-lb", bind_addr, Some(addr))));
@@ -105,7 +107,7 @@ impl TcpProxy {
             cache: ConnectionCache::new(cache_size_bytes),
             stats,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections: 10000,
+            max_connections,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
             recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
@@ -113,6 +115,10 @@ impl TcpProxy {
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: Some(lb),
         }
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
     }
 
     /* ---------- Accessors for WebState sharing ---------- */
@@ -509,7 +515,7 @@ mod tests {
         let target_addr = mock_server.addr();
         tokio::spawn(mock_server.echo_server());
 
-        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024);
+        let proxy = TcpProxy::new("127.0.0.1:0", &target_addr.to_string(), 128 * 1024, 10000);
         // Use start() loop pattern from original tests: we emulate acceptor here
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
@@ -550,7 +556,7 @@ mod tests {
         assert_eq!(&buf[..n], msg);
 
         // ensure proxy is used, avoid dead-code warn
-        assert_eq!(proxy.max_connections, 10000);
+        assert_eq!(proxy.max_connections(), 10000);
     }
 
     #[tokio::test]

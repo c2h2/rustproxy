@@ -94,6 +94,19 @@ fn normalize_bind_addr(addr: &str) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // Raise fd soft limit to hard limit and compute max connections
+    let max_connections = {
+        let old_soft = rlimit::getrlimit(rlimit::Resource::NOFILE)
+            .map(|(soft, _)| soft)
+            .unwrap_or(1024);
+        let new_soft = rlimit::increase_nofile_limit(u64::MAX).unwrap_or(old_soft);
+        info!("fd limit: {} -> {} (soft raised to hard)", old_soft, new_soft);
+        let max_conns = ((new_soft / 2) as usize).saturating_sub(100);
+        let max_conns = max_conns.max(128); // floor at 128
+        info!("Max connections: {} (derived from fd limit {})", max_conns, new_soft);
+        max_conns
+    };
+
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -321,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr);
+                let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections);
 
                 // Spawn web interface if configured
                 if let Some(ref iface) = http_interface {
@@ -333,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         total_tx_bytes: proxy.total_tx_ref(),
                         total_rx_bytes: proxy.total_rx_ref(),
                         start_time: proxy.start_time(),
+                        max_connections: proxy.max_connections(),
                     });
                     tokio::spawn(web::start_web_interface(web_bind, web_state));
                 }
@@ -359,7 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // Single-target mode (unchanged)
-                let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr);
+                let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr, max_connections);
                 if let Err(e) = proxy.start().await {
                     error!("TCP proxy error: {}", e);
                     return Err(e);

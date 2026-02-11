@@ -199,7 +199,8 @@
                 document.getElementById('listen-addr').textContent = data.listen_addr;
                 document.getElementById('algorithm').textContent = data.algorithm;
                 document.getElementById('uptime').textContent = formatUptime(data.uptime_secs);
-                document.getElementById('active-conns').textContent = data.active_connections;
+                document.getElementById('active-conns').textContent =
+                    data.active_connections.toLocaleString() + ' / ' + data.max_connections.toLocaleString();
                 document.getElementById('traffic').textContent =
                     formatBytes(data.total_tx_bytes) + ' / ' + formatBytes(data.total_rx_bytes);
                 document.getElementById('backend-count').textContent =
