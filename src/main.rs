@@ -12,6 +12,7 @@ pub mod manager;
 mod lb;
 mod web;
 mod healthcheck;
+mod traffic_log;
 
 #[cfg(test)]
 mod test_utils;
@@ -42,6 +43,7 @@ fn print_usage() {
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
+    println!("  --traffic-log <path>         CSV file for persistent traffic history (default: ./rustproxy_traffic.csv)");
     println!("  --healthcheck                Enable SOCKS5 healthcheck for TCP LB backends");
     println!("                               Probes each backend via SOCKS5 CONNECT every 60s");
     println!("                               Disables failing backends; re-enables on recovery");
@@ -139,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lb_algorithm = None;
     let mut http_interface = None;
     let mut healthcheck_enabled = false;
+    let mut traffic_log_path = String::from("./rustproxy_traffic.csv");
 
     let mut i = 1;
     while i < args.len() {
@@ -202,6 +205,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--http-interface" => {
                 if i + 1 < args.len() {
                     http_interface = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--traffic-log" => {
+                if i + 1 < args.len() {
+                    traffic_log_path = args[i + 1].clone();
                     i += 2;
                 } else {
                     i += 1;
@@ -336,6 +347,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections);
 
+                // Load persistent traffic log
+                let tlog = Arc::new(traffic_log::TrafficLog::load(std::path::Path::new(&traffic_log_path)));
+
                 // Spawn web interface if configured
                 if let Some(ref iface) = http_interface {
                     let web_bind = normalize_bind_addr(iface);
@@ -347,9 +361,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         total_rx_bytes: proxy.total_rx_ref(),
                         start_time: proxy.start_time(),
                         max_connections: proxy.max_connections(),
+                        traffic_log: tlog.clone(),
                     });
                     tokio::spawn(web::start_web_interface(web_bind, web_state));
                 }
+
+                // Spawn background traffic recorder (every 60s)
+                traffic_log::spawn_traffic_recorder(
+                    tlog.clone(),
+                    proxy.total_tx_ref(),
+                    proxy.total_rx_ref(),
+                );
 
                 // Spawn self-test task
                 {

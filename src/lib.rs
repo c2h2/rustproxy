@@ -7,6 +7,7 @@ pub mod manager;
 pub mod lb;
 pub mod web;
 pub mod healthcheck;
+pub mod traffic_log;
 
 #[cfg(test)]
 pub mod test_utils;

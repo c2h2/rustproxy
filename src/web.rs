@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
@@ -12,6 +13,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use crate::lb::LoadBalancer;
+use crate::traffic_log::TrafficLog;
 
 /* ------------------------------ State ------------------------------ */
 
@@ -23,6 +25,7 @@ pub struct WebState {
     pub total_rx_bytes: Arc<AtomicU64>,
     pub start_time: Instant,
     pub max_connections: usize,
+    pub traffic_log: Arc<TrafficLog>,
 }
 
 /* ------------------------------ JSON types ------------------------------ */
@@ -57,6 +60,18 @@ struct HealthResponse {
     uptime_secs: u64,
 }
 
+#[derive(Serialize)]
+struct TrafficHistoryResponse {
+    points: Vec<crate::traffic_log::TrafficSample>,
+    total_tx_24h: u64,
+    total_rx_24h: u64,
+}
+
+#[derive(Serialize)]
+struct TrafficDatesResponse {
+    dates: Vec<String>,
+}
+
 /* ------------------------------ Handlers ------------------------------ */
 
 async fn index() -> Html<&'static str> {
@@ -72,14 +87,15 @@ async fn api_backends(State(state): State<Arc<WebState>>) -> impl IntoResponse {
 
 async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let uptime = Instant::now().duration_since(state.start_time).as_secs();
+    let tl = &state.traffic_log;
     Json(StatsResponse {
         listen_addr: state.listen_addr.clone(),
         algorithm: state.lb.algorithm().as_str().to_string(),
         uptime_secs: uptime,
         active_connections: state.active_connections.load(Ordering::Relaxed),
         max_connections: state.max_connections,
-        total_tx_bytes: state.total_tx_bytes.load(Ordering::Relaxed),
-        total_rx_bytes: state.total_rx_bytes.load(Ordering::Relaxed),
+        total_tx_bytes: tl.adjusted_tx(state.total_tx_bytes.load(Ordering::Relaxed)),
+        total_rx_bytes: tl.adjusted_rx(state.total_rx_bytes.load(Ordering::Relaxed)),
         backends: state.lb.snapshot(),
     })
 }
@@ -138,6 +154,53 @@ async fn api_disable_backend(
     }
 }
 
+async fn api_traffic_history(
+    State(state): State<Arc<WebState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp();
+    let start = params
+        .get("start")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(now - 86400);
+    let end = params
+        .get("end")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(now);
+
+    let mut points = state.traffic_log.query_range(start, end).await;
+
+    // Downsample if too many points (keep max ~500)
+    if points.len() > 500 {
+        let step = points.len() / 500;
+        points = points.into_iter().step_by(step).collect();
+    }
+
+    // Compute 24h totals from deltas
+    let samples_24h = state.traffic_log.query_last(86400).await;
+    let (total_tx_24h, total_rx_24h) = if samples_24h.len() >= 2 {
+        let first = &samples_24h[0];
+        let last = &samples_24h[samples_24h.len() - 1];
+        (
+            last.tx_bytes.saturating_sub(first.tx_bytes),
+            last.rx_bytes.saturating_sub(first.rx_bytes),
+        )
+    } else {
+        (0, 0)
+    };
+
+    Json(TrafficHistoryResponse {
+        points,
+        total_tx_24h,
+        total_rx_24h,
+    })
+}
+
+async fn api_traffic_dates(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    let dates = state.traffic_log.dates_with_data().await;
+    Json(TrafficDatesResponse { dates })
+}
+
 /* ------------------------------ Server ------------------------------ */
 
 pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
@@ -148,6 +211,8 @@ pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
         .route("/api/backends/:id/disable", post(api_disable_backend))
         .route("/api/stats", get(api_stats))
         .route("/api/health", get(api_health))
+        .route("/api/traffic/history", get(api_traffic_history))
+        .route("/api/traffic/dates", get(api_traffic_dates))
         .with_state(state);
 
     info!("LB dashboard listening on http://{}", bind_addr);
