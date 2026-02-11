@@ -314,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let is_lb_mode = target.contains(',') || lb_algorithm.is_some();
 
             if is_lb_mode {
-                // Parse LB algorithm (default: roundrobin)
+                // Parse LB algorithm (default: random)
                 let algo = match &lb_algorithm {
                     Some(s) => match LbAlgorithm::from_str(s) {
                         Ok(a) => a,
@@ -323,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             std::process::exit(1);
                         }
                     },
-                    None => LbAlgorithm::RoundRobin,
+                    None => LbAlgorithm::Random,
                 };
 
                 let lb = match lb::LoadBalancer::new(&target, algo) {
