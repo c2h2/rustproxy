@@ -61,6 +61,15 @@ else
     fi
 fi
 
+# Check if container engine (Docker/Podman) is available - required for cross
+if [ "$USE_CROSS" = true ]; then
+    if ! command -v docker &> /dev/null && ! command -v podman &> /dev/null; then
+        echo -e "${YELLOW}  Warning: No container engine (docker/podman) found for cross.${NC}"
+        echo "  Will use cargo with cross-compiler toolchain instead."
+        USE_CROSS=false
+    fi
+fi
+
 echo ""
 echo -e "${YELLOW}🏗️  Building for multiple architectures...${NC}"
 
@@ -128,7 +137,7 @@ TOTAL_COUNT=${#TARGETS[@]}
 
 for target in "${TARGETS[@]}"; do
     if build_target "${target}"; then
-        ((SUCCESS_COUNT++))
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     fi
 done
 
