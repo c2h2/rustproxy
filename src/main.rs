@@ -42,7 +42,10 @@ fn print_usage() {
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
-    println!("  --healthcheck                Enable SOCKS5 healthcheck for LB backends (60s interval)");
+    println!("  --healthcheck                Enable SOCKS5 healthcheck for TCP LB backends");
+    println!("                               Probes each backend via SOCKS5 CONNECT every 60s");
+    println!("                               Disables failing backends; re-enables on recovery");
+    println!("                               Safety valve: re-enables all if every backend fails");
     println!();
     println!("Examples:");
     println!("  rustproxy --manager");
@@ -55,6 +58,11 @@ fn print_usage() {
     println!("  rustproxy --listen 127.0.0.1:8080 \\");
     println!("    --target 192.168.1.100:9000,192.168.1.100:9001,192.168.1.100:9002 \\");
     println!("    --mode tcp --lb random --http-interface :8888");
+    println!();
+    println!("Load Balancing with Healthcheck:");
+    println!("  rustproxy --listen 127.0.0.1:8080 \\");
+    println!("    --target 10.0.0.1:1080,10.0.0.2:1080,10.0.0.3:1080 \\");
+    println!("    --mode tcp --lb roundrobin --http-interface :8888 --healthcheck");
     println!();
     println!("Environment Variables:");
     println!("  RUSTPROXY_MANAGER=<addr:port>  Set manager address for stats reporting");

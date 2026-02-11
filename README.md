@@ -10,6 +10,7 @@ A high-performance proxy server written in Rust with configurable connection cac
 - **SOCKS5 Proxy**: Full SOCKS5 server with optional authentication
 - **Connection Caching**: Configurable connection pooling to improve performance
 - **Web Dashboard**: Built-in HAProxy-style dashboard for load balancer monitoring and control
+- **SOCKS5 Healthcheck**: Automatic backend health probing with disable/re-enable logic
 - **REST API**: Enable/disable backends at runtime via HTTP API
 - **Async/Await**: Built with Tokio for high-performance async networking
 - **Flexible Configuration**: Command-line configuration with sensible defaults
@@ -38,6 +39,7 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
 - `--socks5-auth <user:pass>` - SOCKS5 authentication credentials (optional)
 - `--lb <random|roundrobin>` - Load balancing algorithm (tcp mode, requires multiple targets)
 - `--http-interface <addr:port>` - HTTP dashboard for LB monitoring (e.g. `:8888`)
+- `--healthcheck` - Enable SOCKS5 healthcheck for TCP LB backends (60s interval)
 - `--manager-addr <addr:port>` - Manager address for stats reporting
 
 ### Examples
@@ -71,6 +73,13 @@ rustproxy --listen 127.0.0.1:8080 \
   --mode tcp --lb random --cache-size 1mb --http-interface :8888
 ```
 
+**TCP Load Balancer with SOCKS5 healthcheck:**
+```bash
+rustproxy --listen 127.0.0.1:8080 \
+  --target 10.0.0.1:1080,10.0.0.2:1080,10.0.0.3:1080 \
+  --mode tcp --lb roundrobin --http-interface :8888 --healthcheck
+```
+
 **HTTP Proxy (local server, no forwarding):**
 ```bash
 rustproxy --listen 127.0.0.1:8080 --mode http
@@ -95,6 +104,7 @@ rustproxy --listen 127.0.0.1:1080 --mode socks5 --cache-size 2mb
 
 - **TCP Proxy** (`src/tcp_proxy.rs`): Handles raw TCP connection forwarding, supports single-target and load-balanced modes
 - **Load Balancer** (`src/lb.rs`): Round-robin and random algorithms, per-backend atomic stats, runtime enable/disable
+- **Healthcheck** (`src/healthcheck.rs`): SOCKS5-based backend health probing with automatic disable/re-enable
 - **Web Dashboard** (`src/web.rs`): Axum-based HTTP server serving the LB dashboard and REST API
 - **Dashboard UI** (`static/lb_dashboard.html`): HAProxy-style web interface with auto-refresh
 - **HTTP Proxy** (`src/http_proxy.rs`): Handles HTTP request/response forwarding
@@ -152,6 +162,18 @@ curl -X POST http://localhost:8888/api/backends/1/enable
 # Get full stats
 curl http://localhost:8888/api/stats
 ```
+
+### SOCKS5 Healthcheck
+
+When `--healthcheck` is enabled (TCP LB mode only), rustproxy continuously monitors backend health:
+
+- **Probe method**: SOCKS5 handshake → CONNECT to `google.com:80` → HTTP GET, verifies `HTTP/` response
+- **Interval**: Every 60 seconds (5-second initial delay after startup)
+- **Timeout**: 10 seconds per probe
+- **On success**: Backend stays enabled (or is re-enabled if previously disabled); response time is recorded
+- **On failure/timeout**: Backend is disabled and removed from rotation
+- **Safety valve**: If ALL backends fail, all are re-enabled to avoid total outage
+- **Dashboard integration**: Healthcheck status and response times are visible in the web dashboard
 
 ### Self-Test
 
