@@ -28,7 +28,7 @@
         </div>
 
         <!-- Summary Cards -->
-        <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
+        <div class="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-8">
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <p class="text-gray-400 text-xs uppercase tracking-wider">Listen</p>
                 <p id="listen-addr" class="text-lg font-bold text-white mt-1 truncate">-</p>
@@ -48,6 +48,10 @@
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <p class="text-gray-400 text-xs uppercase tracking-wider">Traffic TX / RX</p>
                 <p id="traffic" class="text-lg font-bold text-white mt-1">0 / 0</p>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Throughput</p>
+                <p id="throughput" class="text-lg font-bold text-yellow-400 mt-1">-</p>
             </div>
         </div>
 
@@ -87,6 +91,14 @@
 
     <script>
         const POLL_INTERVAL = 2000;
+        let prevTx = null, prevRx = null, prevTime = null;
+
+        function formatRate(bitsPerSec) {
+            if (bitsPerSec >= 1e9) return (bitsPerSec / 1e9).toFixed(1) + ' Gbps';
+            if (bitsPerSec >= 1e6) return (bitsPerSec / 1e6).toFixed(1) + ' Mbps';
+            if (bitsPerSec >= 1e3) return (bitsPerSec / 1e3).toFixed(1) + ' Kbps';
+            return Math.floor(bitsPerSec) + ' bps';
+        }
 
         function formatBytes(b) {
             if (b === 0) return '0 B';
@@ -203,6 +215,22 @@
                     data.active_connections.toLocaleString() + ' / ' + data.max_connections.toLocaleString();
                 document.getElementById('traffic').textContent =
                     formatBytes(data.total_tx_bytes) + ' / ' + formatBytes(data.total_rx_bytes);
+
+                // Compute throughput from byte deltas
+                const now = Date.now();
+                if (prevTx !== null && prevTime !== null) {
+                    const dtSec = (now - prevTime) / 1000;
+                    if (dtSec > 0) {
+                        const txRate = ((data.total_tx_bytes - prevTx) * 8) / dtSec;
+                        const rxRate = ((data.total_rx_bytes - prevRx) * 8) / dtSec;
+                        document.getElementById('throughput').textContent =
+                            formatRate(txRate) + ' / ' + formatRate(rxRate);
+                    }
+                }
+                prevTx = data.total_tx_bytes;
+                prevRx = data.total_rx_bytes;
+                prevTime = now;
+
                 document.getElementById('backend-count').textContent =
                     data.backends.length + ' backend' + (data.backends.length !== 1 ? 's' : '');
 
