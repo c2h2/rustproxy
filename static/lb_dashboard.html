@@ -117,11 +117,13 @@
         let prevTx = null, prevRx = null, prevTime = null;
         let trafficChart = null;
 
-        function formatRate(bitsPerSec) {
-            if (bitsPerSec >= 1e9) return (bitsPerSec / 1e9).toFixed(1) + ' Gbps';
-            if (bitsPerSec >= 1e6) return (bitsPerSec / 1e6).toFixed(1) + ' Mbps';
-            if (bitsPerSec >= 1e3) return (bitsPerSec / 1e3).toFixed(1) + ' Kbps';
-            return Math.floor(bitsPerSec) + ' bps';
+        function fmtNum(v) { return v >= 10 ? Math.floor(v).toString() : v.toFixed(1); }
+
+        function formatRate(bytesPerSec) {
+            if (bytesPerSec >= 1e9) return fmtNum(bytesPerSec / 1e9) + ' GB/s';
+            if (bytesPerSec >= 1e6) return fmtNum(bytesPerSec / 1e6) + ' MB/s';
+            if (bytesPerSec >= 1e3) return fmtNum(bytesPerSec / 1e3) + ' KB/s';
+            return Math.floor(bytesPerSec) + ' B/s';
         }
 
         function formatBytes(b) {
@@ -232,7 +234,7 @@
                 data: {
                     datasets: [
                         {
-                            label: 'TX Rate (Mbps)',
+                            label: 'TX Rate (MB/s)',
                             borderColor: '#22c55e',
                             backgroundColor: 'rgba(34,197,94,0.1)',
                             fill: true,
@@ -242,7 +244,7 @@
                             data: []
                         },
                         {
-                            label: 'RX Rate (Mbps)',
+                            label: 'RX Rate (MB/s)',
                             borderColor: '#3b82f6',
                             backgroundColor: 'rgba(59,130,246,0.1)',
                             fill: true,
@@ -262,7 +264,7 @@
                         tooltip: {
                             callbacks: {
                                 label: function(ctx) {
-                                    return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2) + ' Mbps';
+                                    return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2) + ' MB/s';
                                 }
                             }
                         }
@@ -310,11 +312,11 @@
                     if (dt <= 0) continue;
                     const txDelta = pts[i].tx_bytes - pts[i-1].tx_bytes;
                     const rxDelta = pts[i].rx_bytes - pts[i-1].rx_bytes;
-                    const txMbps = (txDelta * 8) / (dt * 1e6);
-                    const rxMbps = (rxDelta * 8) / (dt * 1e6);
+                    const txMBs = txDelta / (dt * 1e6);
+                    const rxMBs = rxDelta / (dt * 1e6);
                     const t = new Date(pts[i].timestamp * 1000);
-                    txRates.push({ x: t, y: Math.max(0, txMbps) });
-                    rxRates.push({ x: t, y: Math.max(0, rxMbps) });
+                    txRates.push({ x: t, y: Math.max(0, txMBs) });
+                    rxRates.push({ x: t, y: Math.max(0, rxMBs) });
                 }
 
                 trafficChart.data.datasets[0].data = txRates;
@@ -361,8 +363,8 @@
                 if (prevTx !== null && prevTime !== null) {
                     const dtSec = (now - prevTime) / 1000;
                     if (dtSec > 0) {
-                        const txRate = ((data.total_tx_bytes - prevTx) * 8) / dtSec;
-                        const rxRate = ((data.total_rx_bytes - prevRx) * 8) / dtSec;
+                        const txRate = (data.total_tx_bytes - prevTx) / dtSec;
+                        const rxRate = (data.total_rx_bytes - prevRx) / dtSec;
                         document.getElementById('throughput').textContent =
                             formatRate(txRate) + ' / ' + formatRate(rxRate);
                     }
