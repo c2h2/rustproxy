@@ -64,6 +64,9 @@ pub struct TcpProxy {
     // When set, SS runs on this port AND plain TCP runs on bind_addr
     ss_listen_config: Option<(String, String, CipherKind)>,
 
+    // VMess listener on a separate port (addr, uuid_bytes)
+    vmess_listen_config: Option<(String, [u8; 16])>,
+
     // Connection tracker for dashboard visibility
     conn_tracker: Option<Arc<ConnectionTracker>>,
 }
@@ -87,6 +90,7 @@ impl TcpProxy {
             buffer_size,
             ss_config: None,
             ss_listen_config: None,
+            vmess_listen_config: None,
             conn_tracker: None,
         }
     }
@@ -117,6 +121,7 @@ impl TcpProxy {
             buffer_size,
             ss_config: None,
             ss_listen_config: None,
+            vmess_listen_config: None,
             conn_tracker: None,
         }
     }
@@ -147,6 +152,7 @@ impl TcpProxy {
             buffer_size,
             ss_config: None,
             ss_listen_config: None,
+            vmess_listen_config: None,
             conn_tracker: None,
         }
     }
@@ -159,6 +165,11 @@ impl TcpProxy {
     /// Plain TCP will continue on `bind_addr`; SS will listen on `addr`.
     pub fn set_ss_listen_addr(&mut self, addr: String, password: String, method: CipherKind) {
         self.ss_listen_config = Some((addr, password, method));
+    }
+
+    /// Configure a VMess listener on a separate port.
+    pub fn set_vmess_listen_addr(&mut self, addr: String, uuid: [u8; 16]) {
+        self.vmess_listen_config = Some((addr, uuid));
     }
 
     pub fn set_conn_tracker(&mut self, tracker: Arc<ConnectionTracker>) {
@@ -403,6 +414,163 @@ impl TcpProxy {
                         }
                         Err(e) => {
                             error!("Failed to accept SS connection: {}", e);
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+
+            // Fall through to plain TCP listener below
+        }
+
+        // If VMess port is configured, spawn VMess listener as background task
+        if let Some((ref vmess_addr, ref vmess_uuid)) = self.vmess_listen_config {
+            let vmess_addr = vmess_addr.clone();
+            let vmess_uuid = *vmess_uuid;
+            let active_connections = self.active_connections.clone();
+            let max_connections = self.max_connections;
+            let recent_conns = self.recent_conns.clone();
+            let total_tx_bytes = self.total_tx_bytes.clone();
+            let total_rx_bytes = self.total_rx_bytes.clone();
+            let buffer_size = self.buffer_size;
+            let conn_tracker = self.conn_tracker.clone();
+            let lb = self.lb.clone();
+
+            tokio::spawn(async move {
+                let vmess_listener = match TcpListener::bind(&vmess_addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Failed to bind VMess listener on {}: {}", vmess_addr, e);
+                        return;
+                    }
+                };
+                let vmess_server = Arc::new(crate::vmess::VMessServer::new(vec![vmess_uuid]));
+                info!("VMess listener on {} — AEAD mode", vmess_addr);
+
+                loop {
+                    match vmess_listener.accept().await {
+                        Ok((stream, client_addr)) => {
+                            let current = active_connections.load(Ordering::Relaxed);
+                            if current >= max_connections {
+                                warn!(
+                                    "Connection limit reached ({}/{}), rejecting VMess {}",
+                                    current, max_connections, client_addr
+                                );
+                                drop(stream);
+                                continue;
+                            }
+
+                            {
+                                let recent = recent_conns.clone();
+                                let ip = client_addr.ip();
+                                tokio::spawn(async move {
+                                    let mut v = recent.lock().await;
+                                    v.push((Instant::now(), ip));
+                                });
+                            }
+
+                            let active_connections = active_connections.clone();
+                            let total_tx_bytes = total_tx_bytes.clone();
+                            let total_rx_bytes = total_rx_bytes.clone();
+                            let tracker = conn_tracker.clone();
+                            let lb = lb.clone();
+                            let vmess_server = vmess_server.clone();
+
+                            active_connections.fetch_add(1, Ordering::Relaxed);
+
+                            tokio::spawn(async move {
+                                let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| t.next_conn_id());
+                                let mut backend_ref: Option<Arc<crate::lb::Backend>> = None;
+                                let outcome: Option<(u64, u64)> = {
+                                    let result: Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> = match vmess_server.accept(stream).await {
+                                        Ok((vmess_stream, target_addr)) => {
+                                            info!("VMess CONNECT from {} to {}", client_addr, target_addr);
+
+                                            if let Some(ref lb) = lb {
+                                                match lb.next_backend() {
+                                                    Some(backend) => {
+                                                        let backend_addr = backend.addr.to_string();
+                                                        if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                                            t.add(cid, client_addr, target_addr.clone());
+                                                        }
+                                                        backend.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                                                        backend.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                                                        backend_ref = Some(backend);
+
+                                                        match parse_host_port(&target_addr) {
+                                                            Ok((host, port)) => {
+                                                                match socks5_connect(&backend_addr, &host, port).await {
+                                                                    Ok(outbound) => {
+                                                                        // Convert VMess stream to AsyncRead+AsyncWrite halves
+                                                                        let (vmess_read, vmess_write) = vmess_stream.into_async_rw();
+                                                                        // Combine into a single stream for relay
+                                                                        let combined = tokio::io::join(vmess_read, vmess_write);
+                                                                        relay_streams(
+                                                                            combined, outbound, client_addr, &target_addr,
+                                                                            total_tx_bytes, total_rx_bytes, buffer_size,
+                                                                        ).await
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("SOCKS5 connect via {} to {} failed: {}", backend_addr, target_addr, e);
+                                                                        Err(e)
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Failed to parse VMess target {}: {}", target_addr, e);
+                                                                Err(e)
+                                                            }
+                                                        }
+                                                    }
+                                                    None => {
+                                                        warn!("All backends disabled, rejecting VMess {}", client_addr);
+                                                        Err("No backends available".into())
+                                                    }
+                                                }
+                                            } else {
+                                                warn!("VMess listener requires LB mode");
+                                                Err("No LB configured for VMess".into())
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("VMess handshake failed from {}: {}", client_addr, e);
+                                            Err(e)
+                                        }
+                                    };
+                                    match result {
+                                        Ok((tx, rx)) => Some((tx, rx)),
+                                        Err(e) => {
+                                            debug!("VMess connection from {} error: {}", client_addr, e);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                    if let Some((tx, rx)) = outcome {
+                                        t.update_bytes(cid, tx, rx);
+                                    }
+                                    t.remove(cid);
+                                }
+
+                                if let Some(ref b) = backend_ref {
+                                    match outcome {
+                                        Some((tx, rx)) => {
+                                            b.stats.total_tx_bytes.fetch_add(tx, Ordering::Relaxed);
+                                            b.stats.total_rx_bytes.fetch_add(rx, Ordering::Relaxed);
+                                        }
+                                        None => {
+                                            b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                                }
+
+                                active_connections.fetch_sub(1, Ordering::Relaxed);
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept VMess connection: {}", e);
                             sleep(Duration::from_millis(100)).await;
                         }
                     }

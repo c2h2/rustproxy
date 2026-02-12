@@ -1,6 +1,7 @@
 pub mod tcp_proxy;
 pub mod http_proxy;
 pub mod socks5_proxy;
+pub mod vmess;
 pub mod connection_cache;
 pub mod stats;
 pub mod manager;

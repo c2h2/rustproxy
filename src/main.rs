@@ -7,6 +7,7 @@ mod tcp_proxy;
 mod http_proxy;
 mod socks5_proxy;
 mod ss_proxy;
+mod vmess;
 mod connection_cache;
 pub mod stats;
 pub mod manager;
@@ -48,6 +49,8 @@ fn print_usage() {
     println!("                               Supported: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, 2022-blake3-aes-256-gcm");
     println!("  --ss-listen-port <addr:port>  Separate SS listener port (tcp mode)");
     println!("                               Plain TCP on --listen, SS on this port");
+    println!("  --vmess-listen-port <addr:port>  VMess listener port (tcp mode, requires --vmess-password)");
+    println!("  --vmess-password <uuid-or-string> VMess user UUID (if not a valid UUID, derives via UUID v5)");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
@@ -158,6 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ss_password = None;
     let mut ss_method = None;
     let mut ss_listen_port = None;
+    let mut vmess_listen_port = None;
+    let mut vmess_password = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -266,6 +271,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--vmess-listen-port" => {
+                if i + 1 < args.len() {
+                    vmess_listen_port = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--vmess-password" => {
+                if i + 1 < args.len() {
+                    vmess_password = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             "--healthcheck" => {
                 healthcheck_enabled = true;
                 i += 1;
@@ -325,6 +346,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if ss_listen_port.is_some() && mode != "tcp" {
         eprintln!("--ss-listen-port is only valid with --mode tcp");
+        std::process::exit(1);
+    }
+
+    // Validate --vmess-listen-port requirements
+    if vmess_listen_port.is_some() && vmess_password.is_none() {
+        eprintln!("--vmess-listen-port requires --vmess-password");
+        std::process::exit(1);
+    }
+    if vmess_listen_port.is_some() && mode != "tcp" {
+        eprintln!("--vmess-listen-port is only valid with --mode tcp");
         std::process::exit(1);
     }
 
@@ -463,6 +494,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     proxy.set_ss_config(pw.clone(), method);
                 }
 
+                // VMess listener on separate port
+                if let Some(ref vmess_port) = vmess_listen_port {
+                    if let Some(ref vmess_pw) = vmess_password {
+                        let vmess_addr = normalize_bind_addr(vmess_port);
+                        let vmess_uuid = vmess::parse_or_derive_uuid(vmess_pw);
+                        let uuid_fmt = uuid::Uuid::from_bytes(vmess_uuid);
+                        info!("VMess UUID: {}", uuid_fmt);
+                        proxy.set_vmess_listen_addr(vmess_addr, vmess_uuid);
+                    }
+                }
+
                 // Load persistent traffic log
                 let tlog = Arc::new(traffic_log::TrafficLog::load(std::path::Path::new(&traffic_log_path)));
 
@@ -471,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let web_bind = normalize_bind_addr(iface);
                     let ss_method_str = ss_cfg.as_ref().map(|(_, m)| format!("{:?}", m)).unwrap_or_default();
                     let ss_listen_addr_str = ss_listen_port.as_ref().map(|p| normalize_bind_addr(p)).unwrap_or_default();
+                    let vmess_listen_addr_str = vmess_listen_port.as_ref().map(|p| normalize_bind_addr(p)).unwrap_or_default();
                     let web_state = Arc::new(web::WebState {
                         lb: lb.clone(),
                         listen_addr: listen.clone(),
@@ -484,6 +527,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ss_mode: ss_cfg.is_some(),
                         ss_method: ss_method_str,
                         ss_listen_port: ss_listen_addr_str,
+                        vmess_mode: vmess_listen_port.is_some(),
+                        vmess_listen_port: vmess_listen_addr_str,
                     });
                     tokio::spawn(web::start_web_interface(web_bind, web_state));
                 }

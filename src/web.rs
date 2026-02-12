@@ -31,6 +31,8 @@ pub struct WebState {
     pub ss_mode: bool,
     pub ss_method: String,
     pub ss_listen_port: String,
+    pub vmess_mode: bool,
+    pub vmess_listen_port: String,
 }
 
 /* ------------------------------ JSON types ------------------------------ */
@@ -54,6 +56,8 @@ struct StatsResponse {
     ss_mode: bool,
     ss_method: String,
     ss_listen_port: String,
+    vmess_mode: bool,
+    vmess_listen_port: String,
 }
 
 #[derive(Serialize)]
@@ -108,6 +112,8 @@ async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         ss_mode: state.ss_mode,
         ss_method: state.ss_method.clone(),
         ss_listen_port: state.ss_listen_port.clone(),
+        vmess_mode: state.vmess_mode,
+        vmess_listen_port: state.vmess_listen_port.clone(),
     })
 }
 
