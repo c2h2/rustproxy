@@ -215,20 +215,16 @@ async fn api_traffic_dates(State(state): State<Arc<WebState>>) -> impl IntoRespo
 #[derive(Serialize)]
 struct ConnectionsResponse {
     active: Vec<crate::conn_tracker::ActiveConnSnapshot>,
-    recent: Vec<crate::conn_tracker::ClosedConnInfo>,
 }
 
 async fn api_connections(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     if let Some(ref tracker) = state.conn_tracker {
         let mut active = tracker.snapshot_active();
         active.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
-        let mut recent = tracker.snapshot_recent().await;
-        recent.sort_by(|a, b| b.closed_epoch.cmp(&a.closed_epoch));
-        Json(ConnectionsResponse { active, recent })
+        Json(ConnectionsResponse { active })
     } else {
         Json(ConnectionsResponse {
             active: vec![],
-            recent: vec![],
         })
     }
 }

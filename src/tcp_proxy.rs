@@ -382,7 +382,7 @@ impl TcpProxy {
                                     if let Some((tx, rx)) = outcome {
                                         t.update_bytes(cid, tx, rx);
                                     }
-                                    t.remove(cid).await;
+                                    t.remove(cid);
                                 }
 
                                 if let Some(ref b) = backend_ref {
@@ -505,7 +505,7 @@ impl TcpProxy {
                                 if let Some((tx, rx)) = outcome {
                                     t.update_bytes(cid, tx, rx);
                                 }
-                                t.remove(cid).await;
+                                t.remove(cid);
                             }
 
                             if let Some(ref b) = backend {
@@ -613,7 +613,7 @@ impl TcpProxy {
                                 if let Some((tx, rx)) = outcome {
                                     t.update_bytes(cid, tx, rx);
                                 }
-                                t.remove(cid).await;
+                                t.remove(cid);
                             }
 
                             if let Some(ref b) = backend {

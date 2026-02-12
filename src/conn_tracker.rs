@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,7 +5,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 /* ------------------------------ Data types ------------------------------ */
 
@@ -18,17 +16,6 @@ pub struct ConnInfo {
     pub rx_bytes: AtomicU64,
     pub started_at: Instant,
     pub started_epoch: u64,
-}
-
-#[derive(Serialize, Clone)]
-pub struct ClosedConnInfo {
-    pub client_addr: String,
-    pub ss_target: String,
-    pub backend_addr: String,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-    pub duration_secs: f64,
-    pub closed_epoch: u64,
 }
 
 #[derive(Serialize)]
@@ -47,17 +34,13 @@ pub struct ActiveConnSnapshot {
 
 pub struct ConnectionTracker {
     active: DashMap<u64, Arc<ConnInfo>>,
-    recent: Mutex<VecDeque<ClosedConnInfo>>,
-    max_recent: usize,
     next_id: AtomicU64,
 }
 
 impl ConnectionTracker {
-    pub fn new(max_recent: usize) -> Self {
+    pub fn new(_max_recent: usize) -> Self {
         Self {
             active: DashMap::new(),
-            recent: Mutex::new(VecDeque::with_capacity(max_recent)),
-            max_recent,
             next_id: AtomicU64::new(1),
         }
     }
@@ -90,27 +73,8 @@ impl ConnectionTracker {
         }
     }
 
-    pub async fn remove(&self, conn_id: u64) {
-        if let Some((_, info)) = self.active.remove(&conn_id) {
-            let now_epoch = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let closed = ClosedConnInfo {
-                client_addr: info.client_addr.to_string(),
-                ss_target: info.ss_target.clone(),
-                backend_addr: info.backend_addr.clone(),
-                tx_bytes: info.tx_bytes.load(Ordering::Relaxed),
-                rx_bytes: info.rx_bytes.load(Ordering::Relaxed),
-                duration_secs: info.started_at.elapsed().as_secs_f64(),
-                closed_epoch: now_epoch,
-            };
-            let mut recent = self.recent.lock().await;
-            if recent.len() >= self.max_recent {
-                recent.pop_front();
-            }
-            recent.push_back(closed);
-        }
+    pub fn remove(&self, conn_id: u64) {
+        self.active.remove(&conn_id);
     }
 
     pub fn snapshot_active(&self) -> Vec<ActiveConnSnapshot> {
@@ -132,11 +96,6 @@ impl ConnectionTracker {
                 }
             })
             .collect()
-    }
-
-    pub async fn snapshot_recent(&self) -> Vec<ClosedConnInfo> {
-        let recent = self.recent.lock().await;
-        recent.iter().cloned().collect()
     }
 
     #[allow(dead_code)]
