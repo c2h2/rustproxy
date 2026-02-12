@@ -321,7 +321,7 @@ impl TcpProxy {
                                                     Some(backend) => {
                                                         let backend_addr = backend.addr.to_string();
                                                         if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
-                                                            t.add(cid, client_addr, target_addr.clone(), backend_addr.clone());
+                                                            t.add(cid, client_addr, target_addr.clone());
                                                         }
                                                         backend.stats.active_connections.fetch_add(1, Ordering::Relaxed);
                                                         backend.stats.total_connections.fetch_add(1, Ordering::Relaxed);
@@ -356,7 +356,7 @@ impl TcpProxy {
                                             } else {
                                                 // No LB — direct connect (original behavior)
                                                 if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
-                                                    t.add(cid, client_addr, target_addr.clone(), target_addr.clone());
+                                                    t.add(cid, client_addr, target_addr.clone());
                                                 }
                                                 TcpProxy::connect_and_relay(
                                                     stream, client_addr, target_addr,
@@ -480,7 +480,7 @@ impl TcpProxy {
                                     Ok(ss_target_addr) => {
                                         let ss_target = ss_target_addr.to_string();
                                         if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
-                                            t.add(cid, client_addr, ss_target, target_addr.clone());
+                                            t.add(cid, client_addr, ss_target);
                                         }
                                         Self::connect_and_relay(
                                             stream, client_addr, target_addr,
@@ -583,7 +583,7 @@ impl TcpProxy {
                         tokio::spawn(async move {
                             let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| {
                                 let cid = t.next_conn_id();
-                                t.add(cid, client_addr, String::new(), target_addr.clone());
+                                t.add(cid, client_addr, String::new());
                                 cid
                             });
 

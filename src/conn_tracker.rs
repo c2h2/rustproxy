@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -11,23 +11,16 @@ use serde::Serialize;
 pub struct ConnInfo {
     pub client_addr: SocketAddr,
     pub ss_target: String,
-    pub backend_addr: String,
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
-    pub started_at: Instant,
-    pub started_epoch: u64,
 }
 
 #[derive(Serialize)]
-pub struct ActiveConnSnapshot {
-    pub id: String,
-    pub client_addr: String,
-    pub ss_target: String,
-    pub backend: String,
+pub struct SsClientSnapshot {
+    pub ip: String,
+    pub connections: usize,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
-    pub duration_secs: f64,
-    pub started_epoch: u64,
 }
 
 /* ------------------------------ Tracker ------------------------------ */
@@ -49,19 +42,12 @@ impl ConnectionTracker {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn add(&self, conn_id: u64, client_addr: SocketAddr, ss_target: String, backend_addr: String) {
-        let now_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+    pub fn add(&self, conn_id: u64, client_addr: SocketAddr, ss_target: String) {
         let info = Arc::new(ConnInfo {
             client_addr,
             ss_target,
-            backend_addr,
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
-            started_at: Instant::now(),
-            started_epoch: now_epoch,
         });
         self.active.insert(conn_id, info);
     }
@@ -77,25 +63,32 @@ impl ConnectionTracker {
         self.active.remove(&conn_id);
     }
 
-    pub fn snapshot_active(&self) -> Vec<ActiveConnSnapshot> {
-        let now = Instant::now();
-        self.active
-            .iter()
-            .map(|entry| {
-                let id = *entry.key();
-                let info = entry.value();
-                ActiveConnSnapshot {
-                    id: id.to_string(),
-                    client_addr: info.client_addr.to_string(),
-                    ss_target: info.ss_target.clone(),
-                    backend: info.backend_addr.clone(),
-                    tx_bytes: info.tx_bytes.load(Ordering::Relaxed),
-                    rx_bytes: info.rx_bytes.load(Ordering::Relaxed),
-                    duration_secs: now.duration_since(info.started_at).as_secs_f64(),
-                    started_epoch: info.started_epoch,
-                }
+    /// Return active SS clients grouped by IP, sorted by connection count descending.
+    pub fn snapshot_ss_clients(&self) -> Vec<SsClientSnapshot> {
+        let mut map: HashMap<IpAddr, (usize, u64, u64)> = HashMap::new();
+        for entry in self.active.iter() {
+            let info = entry.value();
+            // Only SS connections (ss_target is non-empty)
+            if info.ss_target.is_empty() {
+                continue;
+            }
+            let ip = info.client_addr.ip();
+            let e = map.entry(ip).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += info.tx_bytes.load(Ordering::Relaxed);
+            e.2 += info.rx_bytes.load(Ordering::Relaxed);
+        }
+        let mut result: Vec<SsClientSnapshot> = map
+            .into_iter()
+            .map(|(ip, (count, tx, rx))| SsClientSnapshot {
+                ip: ip.to_string(),
+                connections: count,
+                tx_bytes: tx,
+                rx_bytes: rx,
             })
-            .collect()
+            .collect();
+        result.sort_by(|a, b| b.connections.cmp(&a.connections));
+        result
     }
 
     #[allow(dead_code)]
