@@ -162,7 +162,10 @@ When `--http-interface` is specified, a built-in web dashboard is available with
 - **Summary header**: Listen address, algorithm, uptime, total active connections, aggregate TX/RX
 - **Backend table**: ID, address, status (UP/DISABLED), active connections, total connections, TX, RX, errors
 - **Enable/Disable buttons**: Toggle backends on/off at runtime
-- **Auto-refresh**: Polls `/api/stats` every 2 seconds
+- **Active connections table**: Per-connection client IP, SS target, backend, TX/RX, duration
+- **Recent connections table**: Last 200 closed connections with stats
+- **SS mode badge**: Shows cipher method when running in SS+TCP LB mode
+- **Auto-refresh**: Polls `/api/stats` and `/api/connections` every 2 seconds
 - **Color coding**: Green = enabled, Red = disabled, Yellow = has errors
 
 ### REST API
@@ -174,6 +177,7 @@ When `--http-interface` is specified, a built-in web dashboard is available with
 | `/api/backends/:id/enable` | POST | Enable a backend |
 | `/api/backends/:id/disable` | POST | Disable a backend |
 | `/api/stats` | GET | Full stats (uptime, connections, bytes, all backends) |
+| `/api/connections` | GET | Active and recent per-connection stats |
 | `/api/health` | GET | Health check |
 
 **Example API usage:**
