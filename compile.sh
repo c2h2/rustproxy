@@ -44,31 +44,22 @@ done
 echo ""
 echo -e "${YELLOW}🔧 Installing cross-compilation dependencies...${NC}"
 
-# Check if cross is available for cross compilation
-if command -v cross &> /dev/null; then
-    echo "  cross tool available - will use for ARM64 compilation"
-    USE_CROSS=true
-else
-    echo "  Installing cross..."
-    cargo install cross --git https://github.com/cross-rs/cross || {
-        echo -e "${RED}Failed to install cross. Will use cargo directly.${NC}"
-        USE_CROSS=false
+# Ensure the aarch64 GCC cross-compiler toolchain is installed
+if ! command -v aarch64-linux-gnu-gcc &> /dev/null; then
+    echo "  aarch64-linux-gnu-gcc not found. Installing via apt..."
+    sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu || {
+        echo -e "${RED}Failed to install aarch64 cross-compiler toolchain.${NC}"
+        echo -e "${RED}Please run manually: sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu${NC}"
+        exit 1
     }
-    if command -v cross &> /dev/null; then
-        USE_CROSS=true
-    else
-        USE_CROSS=false
-    fi
+else
+    echo "  aarch64-linux-gnu-gcc found: $(aarch64-linux-gnu-gcc --version | head -1)"
 fi
 
-# Check if container engine (Docker/Podman) is available - required for cross
-if [ "$USE_CROSS" = true ]; then
-    if ! command -v docker &> /dev/null && ! command -v podman &> /dev/null; then
-        echo -e "${YELLOW}  Warning: No container engine (docker/podman) found for cross.${NC}"
-        echo "  Will use cargo with cross-compiler toolchain instead."
-        USE_CROSS=false
-    fi
-fi
+# Configure cargo to use the cross-compiler linker for aarch64
+export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 
 echo ""
 echo -e "${YELLOW}🏗️  Building for multiple architectures...${NC}"
@@ -91,25 +82,12 @@ build_target() {
     esac
     
     echo -e "${BLUE}Building for ${arch_name} (${target})...${NC}"
-    
-    # Use cross for ARM64, cargo for x86_64
-    if [ "$target" = "aarch64-unknown-linux-gnu" ] && [ "$USE_CROSS" = true ]; then
-        echo "  Using cross for ARM64 compilation..."
-        cross build --release --target "${target}" || {
-            echo -e "${RED}Failed to build for ${target} with cross${NC}"
-            echo "  Falling back to cargo..."
-            cargo build --release --target "${target}" || {
-                echo -e "${RED}Failed to build for ${target} with cargo${NC}"
-                return 1
-            }
-        }
-    else
-        echo "  Using cargo for compilation..."
-        cargo build --release --target "${target}" || {
-            echo -e "${RED}Failed to build for ${target}${NC}"
-            return 1
-        }
-    fi
+
+    echo "  Using cargo for compilation..."
+    cargo build --release --target "${target}" || {
+        echo -e "${RED}Failed to build for ${target}${NC}"
+        return 1
+    }
     
     # Copy binary to dist folder with architecture suffix
     local binary_name="${PROJECT_NAME}"

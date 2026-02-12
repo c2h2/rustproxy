@@ -45,7 +45,7 @@ fn print_usage() {
     println!("  --socks5-auth <user:pass>    SOCKS5 authentication (optional)");
     println!("  --ss-password <password>     Shadowsocks pre-shared key (required for ss mode)");
     println!("  --ss-method <cipher>         Shadowsocks cipher (default: aes-256-gcm)");
-    println!("                               Supported: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305");
+    println!("                               Supported: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, 2022-blake3-aes-256-gcm");
     println!("  --ss-listen-port <addr:port>  Separate SS listener port (tcp mode)");
     println!("                               Plain TCP on --listen, SS on this port");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
@@ -415,7 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let method: CipherKind = match method_str.parse() {
                     Ok(m) => m,
                     Err(_) => {
-                        eprintln!("Unsupported SS cipher: {}. Use aes-128-gcm, aes-256-gcm, or chacha20-ietf-poly1305", method_str);
+                        eprintln!("Unsupported SS cipher: {}. Use aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, or 2022-blake3-aes-256-gcm", method_str);
                         std::process::exit(1);
                     }
                 };
@@ -559,7 +559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let method: CipherKind = match method_str.parse() {
                 Ok(m) => m,
                 Err(_) => {
-                    eprintln!("Unsupported SS cipher: {}. Use aes-128-gcm, aes-256-gcm, or chacha20-ietf-poly1305", method_str);
+                    eprintln!("Unsupported SS cipher: {}. Use aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, or 2022-blake3-aes-256-gcm", method_str);
                     std::process::exit(1);
                 }
             };
