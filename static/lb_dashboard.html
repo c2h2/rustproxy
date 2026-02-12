@@ -31,7 +31,7 @@
         </div>
 
         <!-- Summary Cards -->
-        <div class="grid grid-cols-2 lg:grid-cols-7 gap-4 mb-8">
+        <div class="grid grid-cols-2 lg:grid-cols-8 gap-4 mb-8">
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <p class="text-gray-400 text-xs uppercase tracking-wider">Listen</p>
                 <p id="listen-addr" class="text-lg font-bold text-white mt-1 truncate">-</p>
@@ -39,6 +39,10 @@
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <p class="text-gray-400 text-xs uppercase tracking-wider">Algorithm</p>
                 <p id="algorithm" class="text-lg font-bold text-blue-400 mt-1">-</p>
+            </div>
+            <div id="ss-mode-card" class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <p class="text-gray-400 text-xs uppercase tracking-wider">Mode</p>
+                <p id="ss-mode" class="text-lg font-bold text-gray-400 mt-1">Plain TCP</p>
             </div>
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <p class="text-gray-400 text-xs uppercase tracking-wider">Uptime</p>
@@ -101,6 +105,55 @@
                         </tr>
                     </thead>
                     <tbody id="backend-tbody" class="divide-y divide-gray-700">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Active Connections Table -->
+        <div class="bg-gray-800 rounded-lg border border-green-900 overflow-hidden mt-8">
+            <div class="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
+                <h2 class="text-xl font-bold text-green-400">Active Connections</h2>
+                <span id="active-conn-count" class="text-gray-400 text-sm">0 connections</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full">
+                    <thead class="bg-gray-900">
+                        <tr>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Client IP</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">SS Target</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Backend</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">TX</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">RX</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Duration</th>
+                        </tr>
+                    </thead>
+                    <tbody id="active-conn-tbody" class="divide-y divide-gray-700">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Recent Connections Table -->
+        <div class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden mt-8">
+            <div class="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
+                <h2 class="text-xl font-bold">Recent Connections</h2>
+                <span id="recent-conn-count" class="text-gray-400 text-sm">0 connections</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full">
+                    <thead class="bg-gray-900">
+                        <tr>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Client IP</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">SS Target</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Backend</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">TX</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">RX</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Duration</th>
+                            <th class="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Closed</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent-conn-tbody" class="divide-y divide-gray-700">
                     </tbody>
                 </table>
             </div>
@@ -223,6 +276,65 @@
                 `;
                 tbody.appendChild(tr);
             });
+        }
+
+        function formatDuration(secs) {
+            if (secs < 60) return secs.toFixed(1) + 's';
+            if (secs < 3600) return Math.floor(secs / 60) + 'm ' + Math.floor(secs % 60) + 's';
+            return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+        }
+
+        function renderActiveConns(conns) {
+            const tbody = document.getElementById('active-conn-tbody');
+            tbody.innerHTML = '';
+            document.getElementById('active-conn-count').textContent =
+                conns.length + ' connection' + (conns.length !== 1 ? 's' : '');
+            conns.forEach(c => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-green-900/20 transition-colors bg-green-900/10';
+                tr.innerHTML = `
+                    <td class="px-4 py-3 text-sm font-mono">${c.client_addr}</td>
+                    <td class="px-4 py-3 text-sm font-mono">${c.ss_target || '<span class="text-gray-500">-</span>'}</td>
+                    <td class="px-4 py-3 text-sm font-mono">${c.backend}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatBytes(c.tx_bytes)}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatBytes(c.rx_bytes)}</td>
+                    <td class="px-4 py-3 text-sm text-right">${formatDuration(c.duration_secs)}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function renderRecentConns(conns) {
+            const tbody = document.getElementById('recent-conn-tbody');
+            tbody.innerHTML = '';
+            document.getElementById('recent-conn-count').textContent =
+                conns.length + ' connection' + (conns.length !== 1 ? 's' : '');
+            conns.forEach(c => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-gray-700/50 transition-colors';
+                tr.innerHTML = `
+                    <td class="px-4 py-3 text-sm font-mono text-gray-400">${c.client_addr}</td>
+                    <td class="px-4 py-3 text-sm font-mono text-gray-400">${c.ss_target || '<span class="text-gray-600">-</span>'}</td>
+                    <td class="px-4 py-3 text-sm font-mono text-gray-400">${c.backend_addr}</td>
+                    <td class="px-4 py-3 text-sm text-right text-gray-400">${formatBytes(c.tx_bytes)}</td>
+                    <td class="px-4 py-3 text-sm text-right text-gray-400">${formatBytes(c.rx_bytes)}</td>
+                    <td class="px-4 py-3 text-sm text-right text-gray-400">${formatDuration(c.duration_secs)}</td>
+                    <td class="px-4 py-3 text-sm text-right text-gray-400">${formatLastCheck(c.closed_epoch)}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function refreshConnections() {
+            try {
+                const res = await fetch('/api/connections');
+                if (!res.ok) return;
+                const data = await res.json();
+                renderActiveConns(data.active);
+                renderRecentConns(data.recent);
+            } catch (e) {
+                console.error('Connections refresh failed:', e);
+            }
         }
 
         // --- Traffic History Chart ---
@@ -380,6 +492,19 @@
                 badge.textContent = 'Healthy';
                 badge.className = 'px-3 py-1 rounded-full text-sm font-medium bg-green-900 text-green-200';
 
+                // SS mode badge
+                const ssCard = document.getElementById('ss-mode-card');
+                const ssLabel = document.getElementById('ss-mode');
+                if (data.ss_mode) {
+                    ssLabel.textContent = 'SS: ' + data.ss_method;
+                    ssLabel.className = 'text-lg font-bold text-purple-400 mt-1';
+                    ssCard.className = 'bg-gray-800 rounded-lg p-4 border border-purple-700 border-l-4';
+                } else {
+                    ssLabel.textContent = 'Plain TCP';
+                    ssLabel.className = 'text-lg font-bold text-gray-400 mt-1';
+                    ssCard.className = 'bg-gray-800 rounded-lg p-4 border border-gray-700';
+                }
+
                 renderBackends(data.backends);
             } catch (e) {
                 console.error('Refresh failed:', e);
@@ -392,8 +517,10 @@
         // Initialize
         initChart();
         refresh();
+        refreshConnections();
         loadLast24h();
         setInterval(refresh, POLL_INTERVAL);
+        setInterval(refreshConnections, POLL_INTERVAL);
         setInterval(loadLast24h, CHART_INTERVAL);
     </script>
 </body>

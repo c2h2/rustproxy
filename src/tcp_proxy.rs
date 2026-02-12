@@ -10,6 +10,7 @@ use tokio::time::{sleep, timeout, Duration};
 
 use tracing::{debug, error, info, warn};
 
+use crate::conn_tracker::ConnectionTracker;
 use crate::connection_cache::ConnectionCache;
 use crate::lb::LoadBalancer;
 use crate::stats::StatsCollector;
@@ -57,6 +58,9 @@ pub struct TcpProxy {
 
     // Optional Shadowsocks listener encryption (password, cipher)
     ss_config: Option<(String, CipherKind)>,
+
+    // Connection tracker for dashboard visibility
+    conn_tracker: Option<Arc<ConnectionTracker>>,
 }
 
 impl TcpProxy {
@@ -77,6 +81,7 @@ impl TcpProxy {
             lb: None,
             buffer_size,
             ss_config: None,
+            conn_tracker: None,
         }
     }
 
@@ -105,6 +110,7 @@ impl TcpProxy {
             lb: None,
             buffer_size,
             ss_config: None,
+            conn_tracker: None,
         }
     }
 
@@ -133,11 +139,21 @@ impl TcpProxy {
             lb: Some(lb),
             buffer_size,
             ss_config: None,
+            conn_tracker: None,
         }
     }
 
     pub fn set_ss_config(&mut self, password: String, method: CipherKind) {
         self.ss_config = Some((password, method));
+    }
+
+    pub fn set_conn_tracker(&mut self, tracker: Arc<ConnectionTracker>) {
+        self.conn_tracker = Some(tracker);
+    }
+
+    #[allow(dead_code)]
+    pub fn conn_tracker_ref(&self) -> Option<Arc<ConnectionTracker>> {
+        self.conn_tracker.clone()
     }
 
     pub fn max_connections(&self) -> usize {
@@ -256,6 +272,7 @@ impl TcpProxy {
                         let total_tx_bytes = self.total_tx_bytes.clone();
                         let total_rx_bytes = self.total_rx_bytes.clone();
                         let buffer_size = self.buffer_size;
+                        let tracker = self.conn_tracker.clone();
 
                         active_connections.fetch_add(1, Ordering::Relaxed);
                         if let Some(ref b) = backend {
@@ -264,35 +281,52 @@ impl TcpProxy {
                         }
 
                         tokio::spawn(async move {
-                            let mut stream = stream;
-                            let result = match stream.handshake().await {
-                                Ok(_target_addr) => {
-                                    // Ignore SS target; relay to LB backend
-                                    Self::connect_and_relay(
-                                        stream, client_addr, target_addr,
-                                        cache, stats, total_tx_bytes, total_rx_bytes, buffer_size,
-                                    ).await
-                                }
-                                Err(e) => {
-                                    debug!("SS handshake failed from {}: {}", client_addr, e);
-                                    Err(e.into())
+                            let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| t.next_conn_id());
+                            let outcome: Option<(u64, u64)> = {
+                                let mut stream = stream;
+                                let result = match stream.handshake().await {
+                                    Ok(ss_target_addr) => {
+                                        let ss_target = ss_target_addr.to_string();
+                                        if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                            t.add(cid, client_addr, ss_target, target_addr.clone());
+                                        }
+                                        Self::connect_and_relay(
+                                            stream, client_addr, target_addr,
+                                            cache, stats, total_tx_bytes, total_rx_bytes, buffer_size,
+                                        ).await
+                                    }
+                                    Err(e) => {
+                                        debug!("SS handshake failed from {}: {}", client_addr, e);
+                                        Err(e.into())
+                                    }
+                                };
+                                match result {
+                                    Ok((tx, rx)) => Some((tx, rx)),
+                                    Err(e) => {
+                                        debug!("SS connection from {} error: {}", client_addr, e);
+                                        None
+                                    }
                                 }
                             };
 
+                            if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                if let Some((tx, rx)) = outcome {
+                                    t.update_bytes(cid, tx, rx);
+                                }
+                                t.remove(cid).await;
+                            }
+
                             if let Some(ref b) = backend {
-                                match &result {
-                                    Ok((tx, rx)) => {
-                                        b.stats.total_tx_bytes.fetch_add(*tx, Ordering::Relaxed);
-                                        b.stats.total_rx_bytes.fetch_add(*rx, Ordering::Relaxed);
+                                match outcome {
+                                    Some((tx, rx)) => {
+                                        b.stats.total_tx_bytes.fetch_add(tx, Ordering::Relaxed);
+                                        b.stats.total_rx_bytes.fetch_add(rx, Ordering::Relaxed);
                                     }
-                                    Err(_) => {
+                                    None => {
                                         b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                            }
-                            if let Err(e) = result {
-                                debug!("SS connection from {} error: {}", client_addr, e);
                             }
                             active_connections.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -346,6 +380,7 @@ impl TcpProxy {
                         let total_tx_bytes = self.total_tx_bytes.clone();
                         let total_rx_bytes = self.total_rx_bytes.clone();
                         let buffer_size = self.buffer_size;
+                        let tracker = self.conn_tracker.clone();
 
                         active_connections.fetch_add(1, Ordering::Relaxed);
                         if let Some(ref b) = backend {
@@ -354,34 +389,52 @@ impl TcpProxy {
                         }
 
                         tokio::spawn(async move {
-                            let result = Self::handle_connection_with_cache(
-                                inbound,
-                                client_addr,
-                                target_addr,
-                                cache,
-                                stats,
-                                active_connections.clone(),
-                                total_tx_bytes,
-                                total_rx_bytes,
-                                buffer_size,
-                            )
-                            .await;
+                            let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| {
+                                let cid = t.next_conn_id();
+                                t.add(cid, client_addr, String::new(), target_addr.clone());
+                                cid
+                            });
+
+                            let outcome: Option<(u64, u64)> = {
+                                let result = Self::handle_connection_with_cache(
+                                    inbound,
+                                    client_addr,
+                                    target_addr,
+                                    cache,
+                                    stats,
+                                    active_connections.clone(),
+                                    total_tx_bytes,
+                                    total_rx_bytes,
+                                    buffer_size,
+                                )
+                                .await;
+                                match result {
+                                    Ok((tx, rx)) => Some((tx, rx)),
+                                    Err(e) => {
+                                        error!("Error handling connection from {}: {}", client_addr, e);
+                                        None
+                                    }
+                                }
+                            };
+
+                            if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                if let Some((tx, rx)) = outcome {
+                                    t.update_bytes(cid, tx, rx);
+                                }
+                                t.remove(cid).await;
+                            }
 
                             if let Some(ref b) = backend {
-                                match &result {
-                                    Ok((tx, rx)) => {
-                                        b.stats.total_tx_bytes.fetch_add(*tx, Ordering::Relaxed);
-                                        b.stats.total_rx_bytes.fetch_add(*rx, Ordering::Relaxed);
+                                match outcome {
+                                    Some((tx, rx)) => {
+                                        b.stats.total_tx_bytes.fetch_add(tx, Ordering::Relaxed);
+                                        b.stats.total_rx_bytes.fetch_add(rx, Ordering::Relaxed);
                                     }
-                                    Err(_) => {
+                                    None => {
                                         b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                            }
-
-                            if let Err(e) = result {
-                                error!("Error handling connection from {}: {}", client_addr, e);
                             }
                             active_connections.fetch_sub(1, Ordering::Relaxed);
                         });

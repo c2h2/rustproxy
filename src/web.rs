@@ -12,6 +12,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+use crate::conn_tracker::ConnectionTracker;
 use crate::lb::LoadBalancer;
 use crate::traffic_log::TrafficLog;
 
@@ -26,6 +27,9 @@ pub struct WebState {
     pub start_time: Instant,
     pub max_connections: usize,
     pub traffic_log: Arc<TrafficLog>,
+    pub conn_tracker: Option<Arc<ConnectionTracker>>,
+    pub ss_mode: bool,
+    pub ss_method: String,
 }
 
 /* ------------------------------ JSON types ------------------------------ */
@@ -46,6 +50,8 @@ struct StatsResponse {
     total_tx_bytes: u64,
     total_rx_bytes: u64,
     backends: Vec<crate::lb::BackendSnapshot>,
+    ss_mode: bool,
+    ss_method: String,
 }
 
 #[derive(Serialize)]
@@ -97,6 +103,8 @@ async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         total_tx_bytes: tl.adjusted_tx(state.total_tx_bytes.load(Ordering::Relaxed)),
         total_rx_bytes: tl.adjusted_rx(state.total_rx_bytes.load(Ordering::Relaxed)),
         backends: state.lb.snapshot(),
+        ss_mode: state.ss_mode,
+        ss_method: state.ss_method.clone(),
     })
 }
 
@@ -201,6 +209,27 @@ async fn api_traffic_dates(State(state): State<Arc<WebState>>) -> impl IntoRespo
     Json(TrafficDatesResponse { dates })
 }
 
+#[derive(Serialize)]
+struct ConnectionsResponse {
+    active: Vec<crate::conn_tracker::ActiveConnSnapshot>,
+    recent: Vec<crate::conn_tracker::ClosedConnInfo>,
+}
+
+async fn api_connections(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    if let Some(ref tracker) = state.conn_tracker {
+        let mut active = tracker.snapshot_active();
+        active.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
+        let mut recent = tracker.snapshot_recent().await;
+        recent.sort_by(|a, b| b.closed_epoch.cmp(&a.closed_epoch));
+        Json(ConnectionsResponse { active, recent })
+    } else {
+        Json(ConnectionsResponse {
+            active: vec![],
+            recent: vec![],
+        })
+    }
+}
+
 /* ------------------------------ Server ------------------------------ */
 
 pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
@@ -210,6 +239,7 @@ pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
         .route("/api/backends/:id/enable", post(api_enable_backend))
         .route("/api/backends/:id/disable", post(api_disable_backend))
         .route("/api/stats", get(api_stats))
+        .route("/api/connections", get(api_connections))
         .route("/api/health", get(api_health))
         .route("/api/traffic/history", get(api_traffic_history))
         .route("/api/traffic/dates", get(api_traffic_dates))

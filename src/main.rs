@@ -14,6 +14,7 @@ mod lb;
 mod web;
 mod healthcheck;
 mod traffic_log;
+mod conn_tracker;
 
 #[cfg(test)]
 mod test_utils;
@@ -421,7 +422,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
+                let tracker = Arc::new(conn_tracker::ConnectionTracker::new(200));
+
                 let mut proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
+                proxy.set_conn_tracker(tracker.clone());
                 if let Some((ref pw, method)) = ss_cfg {
                     proxy.set_ss_config(pw.clone(), method);
                 }
@@ -432,6 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Spawn web interface if configured
                 if let Some(ref iface) = http_interface {
                     let web_bind = normalize_bind_addr(iface);
+                    let ss_method_str = ss_cfg.as_ref().map(|(_, m)| format!("{:?}", m)).unwrap_or_default();
                     let web_state = Arc::new(web::WebState {
                         lb: lb.clone(),
                         listen_addr: listen.clone(),
@@ -441,6 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         start_time: proxy.start_time(),
                         max_connections: proxy.max_connections(),
                         traffic_log: tlog.clone(),
+                        conn_tracker: Some(tracker.clone()),
+                        ss_mode: ss_cfg.is_some(),
+                        ss_method: ss_method_str,
                     });
                     tokio::spawn(web::start_web_interface(web_bind, web_state));
                 }

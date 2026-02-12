@@ -8,6 +8,7 @@ pub mod lb;
 pub mod web;
 pub mod healthcheck;
 pub mod traffic_log;
+pub mod conn_tracker;
 
 #[cfg(test)]
 pub mod test_utils;
