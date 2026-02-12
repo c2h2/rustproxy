@@ -46,6 +46,8 @@ fn print_usage() {
     println!("  --ss-password <password>     Shadowsocks pre-shared key (required for ss mode)");
     println!("  --ss-method <cipher>         Shadowsocks cipher (default: aes-256-gcm)");
     println!("                               Supported: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305");
+    println!("  --ss-listen-port <addr:port>  Separate SS listener port (tcp mode)");
+    println!("                               Plain TCP on --listen, SS on this port");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
@@ -155,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer_size_str = None;
     let mut ss_password = None;
     let mut ss_method = None;
+    let mut ss_listen_port = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -255,6 +258,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--ss-listen-port" => {
+                if i + 1 < args.len() {
+                    ss_listen_port = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             "--healthcheck" => {
                 healthcheck_enabled = true;
                 i += 1;
@@ -304,6 +315,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validate SS mode requirements
     if mode == "ss" && ss_password.is_none() {
         eprintln!("--ss-password is required for --mode ss");
+        std::process::exit(1);
+    }
+
+    // Validate --ss-listen-port requirements
+    if ss_listen_port.is_some() && ss_password.is_none() {
+        eprintln!("--ss-listen-port requires --ss-password");
+        std::process::exit(1);
+    }
+    if ss_listen_port.is_some() && mode != "tcp" {
+        eprintln!("--ss-listen-port is only valid with --mode tcp");
         std::process::exit(1);
     }
 
@@ -363,7 +384,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "tcp" => {
             if ss_password.is_some() {
                 let method_str = ss_method.as_deref().unwrap_or("aes-256-gcm");
-                info!("Starting SS+TCP proxy on {} -> {} (SS method: {}, cache: {})", listen, target.as_ref().unwrap(), method_str, cache_display);
+                if let Some(ref ss_port) = ss_listen_port {
+                    let ss_addr = normalize_bind_addr(ss_port);
+                    info!("Starting TCP LB on {} + SS on {} -> {} (SS method: {}, cache: {})", listen, ss_addr, target.as_ref().unwrap(), method_str, cache_display);
+                } else {
+                    info!("Starting SS+TCP proxy on {} -> {} (SS method: {}, cache: {})", listen, target.as_ref().unwrap(), method_str, cache_display);
+                }
             } else {
                 info!("Starting {} proxy: {} -> {} (cache: {})", mode, listen, target.as_ref().unwrap(), cache_display);
             }
@@ -426,7 +452,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
                 proxy.set_conn_tracker(tracker.clone());
-                if let Some((ref pw, method)) = ss_cfg {
+                if let Some(ref ss_port) = ss_listen_port {
+                    // Separate SS listener on its own port; plain TCP stays on --listen
+                    if let Some((ref pw, method)) = ss_cfg {
+                        let ss_addr = normalize_bind_addr(ss_port);
+                        proxy.set_ss_listen_addr(ss_addr, pw.clone(), method);
+                    }
+                } else if let Some((ref pw, method)) = ss_cfg {
+                    // Legacy: SS replaces plain TCP on the same port
                     proxy.set_ss_config(pw.clone(), method);
                 }
 
@@ -437,6 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref iface) = http_interface {
                     let web_bind = normalize_bind_addr(iface);
                     let ss_method_str = ss_cfg.as_ref().map(|(_, m)| format!("{:?}", m)).unwrap_or_default();
+                    let ss_listen_addr_str = ss_listen_port.as_ref().map(|p| normalize_bind_addr(p)).unwrap_or_default();
                     let web_state = Arc::new(web::WebState {
                         lb: lb.clone(),
                         listen_addr: listen.clone(),
@@ -449,6 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         conn_tracker: Some(tracker.clone()),
                         ss_mode: ss_cfg.is_some(),
                         ss_method: ss_method_str,
+                        ss_listen_port: ss_listen_addr_str,
                     });
                     tokio::spawn(web::start_web_interface(web_bind, web_state));
                 }

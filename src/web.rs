@@ -30,6 +30,7 @@ pub struct WebState {
     pub conn_tracker: Option<Arc<ConnectionTracker>>,
     pub ss_mode: bool,
     pub ss_method: String,
+    pub ss_listen_port: String,
 }
 
 /* ------------------------------ JSON types ------------------------------ */
@@ -52,6 +53,7 @@ struct StatsResponse {
     backends: Vec<crate::lb::BackendSnapshot>,
     ss_mode: bool,
     ss_method: String,
+    ss_listen_port: String,
 }
 
 #[derive(Serialize)]
@@ -105,6 +107,7 @@ async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         backends: state.lb.snapshot(),
         ss_mode: state.ss_mode,
         ss_method: state.ss_method.clone(),
+        ss_listen_port: state.ss_listen_port.clone(),
     })
 }
 

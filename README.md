@@ -41,6 +41,7 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
 - `--socks5-auth <user:pass>` - SOCKS5 authentication credentials (optional)
 - `--ss-password <password>` - Shadowsocks pre-shared key (required for `ss` mode, optional for `tcp` mode)
 - `--ss-method <cipher>` - Shadowsocks cipher (default: `aes-256-gcm`). Supported: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
+- `--ss-listen-port <addr:port>` - Separate SS listener port (tcp mode). Plain TCP on `--listen`, SS on this port
 - `--lb <random|roundrobin>` - Load balancing algorithm (tcp mode, requires multiple targets)
 - `--http-interface <addr:port>` - HTTP dashboard for LB monitoring (e.g. `:8888`)
 - `--healthcheck` - Enable HTTP ping healthcheck for TCP LB backends (60s interval)
@@ -117,6 +118,15 @@ rustproxy --listen 0.0.0.0:11180 \
   --mode tcp --ss-password mypassword --ss-method aes-256-gcm \
   --http-interface 0.0.0.0:62088 --healthcheck
 ```
+
+**Shadowsocks + TCP Load Balancer (separate ports for plain TCP and SS):**
+```bash
+rustproxy --listen 0.0.0.0:11180 \
+  --target 127.0.0.1:10800,127.0.0.1:10801,127.0.0.1:10802 \
+  --mode tcp --ss-password mypassword --ss-method aes-256-gcm \
+  --ss-listen-port 11181 --http-interface 0.0.0.0:62088 --healthcheck
+```
+This gives port 11180 for plain TCP load balancing and port 11181 for SS clients, both routing to the same backends.
 
 In SS+TCP LB mode, rustproxy accepts encrypted Shadowsocks client connections, decrypts the traffic, then load-balances across the backend targets. Connect with any standard SS client:
 ```bash

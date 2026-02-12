@@ -57,7 +57,12 @@ pub struct TcpProxy {
     buffer_size: usize,
 
     // Optional Shadowsocks listener encryption (password, cipher)
+    // When set, SS replaces the plain TCP listener on the same port
     ss_config: Option<(String, CipherKind)>,
+
+    // Separate SS listener on a different port (addr, password, cipher)
+    // When set, SS runs on this port AND plain TCP runs on bind_addr
+    ss_listen_config: Option<(String, String, CipherKind)>,
 
     // Connection tracker for dashboard visibility
     conn_tracker: Option<Arc<ConnectionTracker>>,
@@ -81,6 +86,7 @@ impl TcpProxy {
             lb: None,
             buffer_size,
             ss_config: None,
+            ss_listen_config: None,
             conn_tracker: None,
         }
     }
@@ -110,6 +116,7 @@ impl TcpProxy {
             lb: None,
             buffer_size,
             ss_config: None,
+            ss_listen_config: None,
             conn_tracker: None,
         }
     }
@@ -139,12 +146,19 @@ impl TcpProxy {
             lb: Some(lb),
             buffer_size,
             ss_config: None,
+            ss_listen_config: None,
             conn_tracker: None,
         }
     }
 
     pub fn set_ss_config(&mut self, password: String, method: CipherKind) {
         self.ss_config = Some((password, method));
+    }
+
+    /// Configure a separate SS listener on a different port.
+    /// Plain TCP will continue on `bind_addr`; SS will listen on `addr`.
+    pub fn set_ss_listen_addr(&mut self, addr: String, password: String, method: CipherKind) {
+        self.ss_listen_config = Some((addr, password, method));
     }
 
     pub fn set_conn_tracker(&mut self, tracker: Arc<ConnectionTracker>) {
@@ -219,6 +233,157 @@ impl TcpProxy {
 
         // Periodic reporter (warn! with port + uptime + totals + last-5m IPs)
         self.spawn_periodic_reporter();
+
+        // If separate SS port is configured, spawn SS listener as background task
+        if let Some((ref ss_addr, ref password, method)) = self.ss_listen_config {
+            let ss_addr = ss_addr.clone();
+            let password = password.clone();
+            let lb = self.lb.clone();
+            let target_addr_fallback = self.target_addr.clone();
+            let active_connections = self.active_connections.clone();
+            let max_connections = self.max_connections;
+            let recent_conns = self.recent_conns.clone();
+            let cache = self.cache.clone();
+            let stats = self.stats.clone();
+            let total_tx_bytes = self.total_tx_bytes.clone();
+            let total_rx_bytes = self.total_rx_bytes.clone();
+            let buffer_size = self.buffer_size;
+            let conn_tracker = self.conn_tracker.clone();
+
+            tokio::spawn(async move {
+                let ss_addr_parsed: SocketAddr = match ss_addr.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        error!("Invalid SS listen address {}: {}", ss_addr, e);
+                        return;
+                    }
+                };
+                let context = Context::new_shared(ServerType::Server);
+                let svr_cfg = match ServerConfig::new(ss_addr_parsed, password.as_str(), method) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Invalid SS config for separate listener: {}", e);
+                        return;
+                    }
+                };
+                let ss_listener = match ProxyListener::bind(context, &svr_cfg).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Failed to bind SS listener on {}: {}", ss_addr, e);
+                        return;
+                    }
+                };
+                info!("SS listener on {} (method: {:?}) — plain TCP on separate port", ss_addr, method);
+
+                loop {
+                    match ss_listener.accept().await {
+                        Ok((stream, client_addr)) => {
+                            let current = active_connections.load(Ordering::Relaxed);
+                            if current >= max_connections {
+                                warn!(
+                                    "Connection limit reached ({}/{}), rejecting SS {}",
+                                    current, max_connections, client_addr
+                                );
+                                drop(stream);
+                                continue;
+                            }
+
+                            {
+                                let recent = recent_conns.clone();
+                                let ip = client_addr.ip();
+                                tokio::spawn(async move {
+                                    let mut v = recent.lock().await;
+                                    v.push((Instant::now(), ip));
+                                });
+                            }
+
+                            let (target_addr, backend) = if let Some(ref lb) = lb {
+                                match lb.next_backend() {
+                                    Some(b) => (b.addr.to_string(), Some(b)),
+                                    None => {
+                                        warn!("All backends disabled, rejecting SS {}", client_addr);
+                                        drop(stream);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                (target_addr_fallback.clone(), None)
+                            };
+
+                            let cache = cache.clone();
+                            let stats = stats.clone();
+                            let active_connections = active_connections.clone();
+                            let total_tx_bytes = total_tx_bytes.clone();
+                            let total_rx_bytes = total_rx_bytes.clone();
+                            let tracker = conn_tracker.clone();
+
+                            active_connections.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref b) = backend {
+                                b.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                                b.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            tokio::spawn(async move {
+                                let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| t.next_conn_id());
+                                let outcome: Option<(u64, u64)> = {
+                                    let mut stream = stream;
+                                    let result = match stream.handshake().await {
+                                        Ok(ss_target_addr) => {
+                                            let ss_target = ss_target_addr.to_string();
+                                            if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                                t.add(cid, client_addr, ss_target, target_addr.clone());
+                                            }
+                                            TcpProxy::connect_and_relay(
+                                                stream, client_addr, target_addr,
+                                                cache, stats, total_tx_bytes, total_rx_bytes, buffer_size,
+                                            ).await
+                                        }
+                                        Err(e) => {
+                                            debug!("SS handshake failed from {}: {}", client_addr, e);
+                                            Err(e.into())
+                                        }
+                                    };
+                                    match result {
+                                        Ok((tx, rx)) => Some((tx, rx)),
+                                        Err(e) => {
+                                            debug!("SS connection from {} error: {}", client_addr, e);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                    if let Some((tx, rx)) = outcome {
+                                        t.update_bytes(cid, tx, rx);
+                                    }
+                                    t.remove(cid).await;
+                                }
+
+                                if let Some(ref b) = backend {
+                                    match outcome {
+                                        Some((tx, rx)) => {
+                                            b.stats.total_tx_bytes.fetch_add(tx, Ordering::Relaxed);
+                                            b.stats.total_rx_bytes.fetch_add(rx, Ordering::Relaxed);
+                                        }
+                                        None => {
+                                            b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                                }
+                                active_connections.fetch_sub(1, Ordering::Relaxed);
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept SS connection: {}", e);
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+
+            // Fall through to plain TCP listener below
+        }
 
         if let Some((ref password, method)) = self.ss_config {
             // ---- Shadowsocks-encrypted listener ----
