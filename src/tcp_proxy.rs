@@ -238,8 +238,6 @@ impl TcpProxy {
         if let Some((ref ss_addr, ref password, method)) = self.ss_listen_config {
             let ss_addr = ss_addr.clone();
             let password = password.clone();
-            let lb = self.lb.clone();
-            let target_addr_fallback = self.target_addr.clone();
             let active_connections = self.active_connections.clone();
             let max_connections = self.max_connections;
             let recent_conns = self.recent_conns.clone();
@@ -249,6 +247,7 @@ impl TcpProxy {
             let total_rx_bytes = self.total_rx_bytes.clone();
             let buffer_size = self.buffer_size;
             let conn_tracker = self.conn_tracker.clone();
+            let lb = self.lb.clone();
 
             tokio::spawn(async move {
                 let ss_addr_parsed: SocketAddr = match ss_addr.parse() {
@@ -273,7 +272,7 @@ impl TcpProxy {
                         return;
                     }
                 };
-                info!("SS listener on {} (method: {:?}) — plain TCP on separate port", ss_addr, method);
+                info!("SS listener on {} (method: {:?}) — standalone SS proxy", ss_addr, method);
 
                 loop {
                     match ss_listener.accept().await {
@@ -297,46 +296,73 @@ impl TcpProxy {
                                 });
                             }
 
-                            let (target_addr, backend) = if let Some(ref lb) = lb {
-                                match lb.next_backend() {
-                                    Some(b) => (b.addr.to_string(), Some(b)),
-                                    None => {
-                                        warn!("All backends disabled, rejecting SS {}", client_addr);
-                                        drop(stream);
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                (target_addr_fallback.clone(), None)
-                            };
-
                             let cache = cache.clone();
                             let stats = stats.clone();
                             let active_connections = active_connections.clone();
                             let total_tx_bytes = total_tx_bytes.clone();
                             let total_rx_bytes = total_rx_bytes.clone();
                             let tracker = conn_tracker.clone();
+                            let lb = lb.clone();
 
                             active_connections.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref b) = backend {
-                                b.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-                                b.stats.total_connections.fetch_add(1, Ordering::Relaxed);
-                            }
 
                             tokio::spawn(async move {
                                 let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| t.next_conn_id());
+                                let mut backend_ref: Option<Arc<crate::lb::Backend>> = None;
                                 let outcome: Option<(u64, u64)> = {
                                     let mut stream = stream;
                                     let result = match stream.handshake().await {
                                         Ok(ss_target_addr) => {
-                                            let ss_target = ss_target_addr.to_string();
-                                            if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
-                                                t.add(cid, client_addr, ss_target, target_addr.clone());
+                                            let target_addr = ss_target_addr.to_string();
+                                            info!("SS CONNECT from {} to {}", client_addr, target_addr);
+
+                                            if let Some(ref lb) = lb {
+                                                match lb.next_backend() {
+                                                    Some(backend) => {
+                                                        let backend_addr = backend.addr.to_string();
+                                                        if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                                            t.add(cid, client_addr, target_addr.clone(), backend_addr.clone());
+                                                        }
+                                                        backend.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                                                        backend.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                                                        backend_ref = Some(backend);
+
+                                                        match parse_host_port(&target_addr) {
+                                                            Ok((host, port)) => {
+                                                                match socks5_connect(&backend_addr, &host, port).await {
+                                                                    Ok(outbound) => {
+                                                                        relay_streams(
+                                                                            stream, outbound, client_addr, &target_addr,
+                                                                            total_tx_bytes, total_rx_bytes, buffer_size,
+                                                                        ).await
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("SOCKS5 connect via {} to {} failed: {}", backend_addr, target_addr, e);
+                                                                        Err(e)
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Failed to parse SS target {}: {}", target_addr, e);
+                                                                Err(e)
+                                                            }
+                                                        }
+                                                    }
+                                                    None => {
+                                                        warn!("All backends disabled, rejecting SS {}", client_addr);
+                                                        Err("No backends available".into())
+                                                    }
+                                                }
+                                            } else {
+                                                // No LB — direct connect (original behavior)
+                                                if let (Some(t), Some(cid)) = (tracker.as_ref(), conn_id) {
+                                                    t.add(cid, client_addr, target_addr.clone(), target_addr.clone());
+                                                }
+                                                TcpProxy::connect_and_relay(
+                                                    stream, client_addr, target_addr,
+                                                    cache, stats, total_tx_bytes, total_rx_bytes, buffer_size,
+                                                ).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
                                             }
-                                            TcpProxy::connect_and_relay(
-                                                stream, client_addr, target_addr,
-                                                cache, stats, total_tx_bytes, total_rx_bytes, buffer_size,
-                                            ).await
                                         }
                                         Err(e) => {
                                             debug!("SS handshake failed from {}: {}", client_addr, e);
@@ -359,7 +385,7 @@ impl TcpProxy {
                                     t.remove(cid).await;
                                 }
 
-                                if let Some(ref b) = backend {
+                                if let Some(ref b) = backend_ref {
                                     match outcome {
                                         Some((tx, rx)) => {
                                             b.stats.total_tx_bytes.fetch_add(tx, Ordering::Relaxed);
@@ -371,6 +397,7 @@ impl TcpProxy {
                                     }
                                     b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
                                 }
+
                                 active_connections.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
@@ -824,6 +851,143 @@ impl TcpProxy {
 
         Ok((bytes_to_server, bytes_to_client))
     }
+}
+
+/* -------------------- SOCKS5 client connect -------------------- */
+
+/// Connect to a SOCKS5 proxy and issue a CONNECT to `target_host:target_port`.
+/// Returns the tunnelled TcpStream ready for data relay.
+async fn socks5_connect(
+    proxy_addr: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stream = timeout(Duration::from_secs(10), TcpStream::connect(proxy_addr))
+        .await
+        .map_err(|_| format!("SOCKS5 connect timeout to {}", proxy_addr))?
+        .map_err(|e| format!("SOCKS5 connect failed to {}: {}", proxy_addr, e))?;
+
+    // Auth negotiation: version 5, 1 method, no-auth
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await?;
+    if buf[0] != 0x05 || buf[1] != 0x00 {
+        return Err(format!("SOCKS5 auth failed: {:02x}{:02x}", buf[0], buf[1]).into());
+    }
+
+    // CONNECT request with domain address type (0x03)
+    let host_bytes = target_host.as_bytes();
+    let mut req = Vec::with_capacity(7 + host_bytes.len());
+    req.push(0x05); // version
+    req.push(0x01); // CONNECT
+    req.push(0x00); // reserved
+    req.push(0x03); // domain
+    req.push(host_bytes.len() as u8);
+    req.extend_from_slice(host_bytes);
+    req.push((target_port >> 8) as u8);
+    req.push((target_port & 0xff) as u8);
+    stream.write_all(&req).await?;
+
+    // Read reply header: ver, rep, rsv, atyp
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await?;
+    if reply[0] != 0x05 || reply[1] != 0x00 {
+        return Err(format!("SOCKS5 CONNECT rejected: reply={:02x}", reply[1]).into());
+    }
+
+    // Drain the bound-address field
+    match reply[3] {
+        0x01 => { let mut skip = [0u8; 6]; stream.read_exact(&mut skip).await?; }     // IPv4 + port
+        0x03 => {                                                                      // Domain + port
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut skip = vec![0u8; len[0] as usize + 2];
+            stream.read_exact(&mut skip).await?;
+        }
+        0x04 => { let mut skip = [0u8; 18]; stream.read_exact(&mut skip).await?; }    // IPv6 + port
+        other => return Err(format!("SOCKS5 unknown atyp: {:02x}", other).into()),
+    }
+
+    Ok(stream)
+}
+
+/// Parse "host:port" into (host, port). Handles `[ipv6]:port` too.
+fn parse_host_port(addr: &str) -> Result<(String, u16), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(bracket_end) = addr.rfind(']') {
+        // [ipv6]:port
+        let host = &addr[1..bracket_end];
+        let port: u16 = addr[bracket_end + 2..].parse()?;
+        return Ok((host.to_string(), port));
+    }
+    let colon = addr.rfind(':').ok_or("Missing port in address")?;
+    let host = &addr[..colon];
+    let port: u16 = addr[colon + 1..].parse()?;
+    Ok((host.to_string(), port))
+}
+
+/// Relay bidirectionally between an inbound stream and an already-connected outbound.
+async fn relay_streams<S>(
+    inbound: S,
+    outbound: TcpStream,
+    client_addr: SocketAddr,
+    target_label: &str,
+    total_tx_bytes: Arc<AtomicU64>,
+    total_rx_bytes: Arc<AtomicU64>,
+    buffer_size: usize,
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let _ = outbound.set_nodelay(true);
+    #[cfg(any(unix, windows))]
+    {
+        let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
+        let _ = SockRef::from(&outbound).set_tcp_keepalive(&ka);
+    }
+
+    info!("Proxying SS via SOCKS5: {} -> {}", client_addr, target_label);
+
+    let (ri, wi) = tokio::io::split(inbound);
+    let (ro, wo) = outbound.into_split();
+
+    let c2s = pump(ri, wo);
+    let (duplex_w, duplex_r) = tokio::io::duplex(buffer_size);
+    let s2buf = tokio::spawn(async move { pump(ro, duplex_w).await });
+    let buf2c = pump(duplex_r, wi);
+
+    let (r1, r_s2buf, r_buf2c) = tokio::join!(c2s, s2buf, buf2c);
+
+    let (bytes_to_server, e1_opt) = match r1 {
+        Ok(n) => (n, None),
+        Err(pe) => (pe.bytes, Some(pe.source)),
+    };
+    let (_bytes_into_buf, e_s2buf) = match r_s2buf {
+        Ok(Ok(n)) => (n, None),
+        Ok(Err(pe)) => (pe.bytes, Some(pe.source)),
+        Err(je) => (0, Some(io::Error::new(io::ErrorKind::Other, je))),
+    };
+    let (bytes_to_client, e_buf2c) = match r_buf2c {
+        Ok(n) => (n, None),
+        Err(pe) => (pe.bytes, Some(pe.source)),
+    };
+
+    if let Some(e) = e1_opt {
+        debug!("Client->Server error after {} bytes for {}: {}", bytes_to_server, client_addr, e);
+    }
+    if let Some(e) = e_s2buf {
+        debug!("Server->Buffer error for {}: {}", client_addr, e);
+    }
+    if let Some(e) = e_buf2c {
+        debug!("Buffer->Client error after {} bytes for {}: {}", bytes_to_client, client_addr, e);
+    }
+
+    total_tx_bytes.fetch_add(bytes_to_server, Ordering::Relaxed);
+    total_rx_bytes.fetch_add(bytes_to_client, Ordering::Relaxed);
+
+    info!("SS connection {} closed. TX {} B, RX {} B", client_addr, bytes_to_server, bytes_to_client);
+
+    Ok((bytes_to_server, bytes_to_client))
 }
 
 /* -------------------------- Accurate pump -------------------------- */
