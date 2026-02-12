@@ -6,11 +6,12 @@ A high-performance proxy server written in Rust with configurable connection cac
 
 - **TCP Proxy**: Forward TCP connections to target servers
 - **TCP Load Balancing**: Distribute connections across multiple backends with round-robin or random algorithms
+- **Shadowsocks Server**: Accept encrypted SS client connections with AEAD ciphers (standalone or combined with TCP LB)
 - **HTTP Proxy**: Forward HTTP requests to target servers
 - **SOCKS5 Proxy**: Full SOCKS5 server with optional authentication
 - **Connection Caching**: Configurable connection pooling to improve performance
 - **Web Dashboard**: Built-in HAProxy-style dashboard for load balancer monitoring and control
-- **SOCKS5 Healthcheck**: Automatic backend health probing with disable/re-enable logic
+- **Healthcheck**: Automatic backend health probing with disable/re-enable logic
 - **REST API**: Enable/disable backends at runtime via HTTP API
 - **Async/Await**: Built with Tokio for high-performance async networking
 - **Flexible Configuration**: Command-line configuration with sensible defaults
@@ -26,20 +27,24 @@ cargo build --release
 ## Usage
 
 ```bash
-rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [options]
+rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5|ss> [options]
 ```
 
 ### Options
 
 - `--listen <address:port>` - Address to listen on
 - `--target <address:port>` - Address to proxy requests to (required for tcp mode). Comma-separated for load balancing
-- `--mode <tcp|http|socks5>` - Proxy mode
-- `--cache-size <size>` - Connection cache size (default: 256KB)
+- `--mode <tcp|http|socks5|ss>` - Proxy mode
+- `--cache-size <size>` - Connection cache size (default: 64MB)
   - Examples: `0`, `none`, `256kb`, `1mb`, `8mb`
+- `--buffer-size <size>` - Server-to-client relay buffer (default: 16MB)
 - `--socks5-auth <user:pass>` - SOCKS5 authentication credentials (optional)
+- `--ss-password <password>` - Shadowsocks pre-shared key (required for `ss` mode, optional for `tcp` mode)
+- `--ss-method <cipher>` - Shadowsocks cipher (default: `aes-256-gcm`). Supported: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 - `--lb <random|roundrobin>` - Load balancing algorithm (tcp mode, requires multiple targets)
 - `--http-interface <addr:port>` - HTTP dashboard for LB monitoring (e.g. `:8888`)
-- `--healthcheck` - Enable SOCKS5 healthcheck for TCP LB backends (60s interval)
+- `--healthcheck` - Enable HTTP ping healthcheck for TCP LB backends (60s interval)
+- `--traffic-log <path>` - CSV file for persistent traffic history (default: `./rustproxy_traffic.csv`)
 - `--manager-addr <addr:port>` - Manager address for stats reporting
 
 ### Examples
@@ -100,11 +105,34 @@ rustproxy --listen 127.0.0.1:1080 --mode socks5 --socks5-auth username:password
 rustproxy --listen 127.0.0.1:1080 --mode socks5 --cache-size 2mb
 ```
 
+**Shadowsocks Server (standalone):**
+```bash
+rustproxy --listen 0.0.0.0:8388 --mode ss --ss-password mypassword --ss-method aes-256-gcm
+```
+
+**Shadowsocks + TCP Load Balancer (SS decryption with LB to backends):**
+```bash
+rustproxy --listen 0.0.0.0:11180 \
+  --target 127.0.0.1:10800,127.0.0.1:10801,127.0.0.1:10802,127.0.0.1:10803,127.0.0.1:10804,127.0.0.1:10805,127.0.0.1:10809,127.0.0.1:10808 \
+  --mode tcp --ss-password mypassword --ss-method aes-256-gcm \
+  --http-interface 0.0.0.0:62088 --healthcheck
+```
+
+In SS+TCP LB mode, rustproxy accepts encrypted Shadowsocks client connections, decrypts the traffic, then load-balances across the backend targets. Connect with any standard SS client:
+```bash
+# Start a local SOCKS5 proxy that tunnels through the SS server
+sslocal -b 127.0.0.1:1080 -s <server-ip>:11180 -k mypassword -m aes-256-gcm
+
+# Then use the local SOCKS5 proxy
+curl -x socks5h://127.0.0.1:1080 http://example.com
+```
+
 ## Architecture
 
-- **TCP Proxy** (`src/tcp_proxy.rs`): Handles raw TCP connection forwarding, supports single-target and load-balanced modes
+- **TCP Proxy** (`src/tcp_proxy.rs`): Handles raw TCP connection forwarding, supports single-target, load-balanced, and SS-encrypted modes
+- **Shadowsocks Proxy** (`src/ss_proxy.rs`): Standalone Shadowsocks server using the `shadowsocks` crate for AEAD decryption
 - **Load Balancer** (`src/lb.rs`): Round-robin and random algorithms, per-backend atomic stats, runtime enable/disable
-- **Healthcheck** (`src/healthcheck.rs`): SOCKS5-based backend health probing with automatic disable/re-enable
+- **Healthcheck** (`src/healthcheck.rs`): HTTP ping backend health probing with automatic disable/re-enable
 - **Web Dashboard** (`src/web.rs`): Axum-based HTTP server serving the LB dashboard and REST API
 - **Dashboard UI** (`static/lb_dashboard.html`): HAProxy-style web interface with auto-refresh
 - **HTTP Proxy** (`src/http_proxy.rs`): Handles HTTP request/response forwarding
@@ -163,11 +191,11 @@ curl -X POST http://localhost:8888/api/backends/1/enable
 curl http://localhost:8888/api/stats
 ```
 
-### SOCKS5 Healthcheck
+### Healthcheck
 
 When `--healthcheck` is enabled (TCP LB mode only), rustproxy continuously monitors backend health:
 
-- **Probe method**: SOCKS5 handshake → CONNECT to `google.com:80` → HTTP GET, verifies `HTTP/` response
+- **Probe method**: Direct HTTP GET to each backend, verifies `HTTP/` response
 - **Interval**: Every 60 seconds (5-second initial delay after startup)
 - **Timeout**: 10 seconds per probe
 - **On success**: Backend stays enabled (or is re-enabled if previously disabled); response time is recorded
@@ -248,6 +276,7 @@ cargo bench
 - **tokio**: Async runtime
 - **axum**: Web framework (dashboard + REST API)
 - **hyper**: HTTP client/server library
+- **shadowsocks**: Shadowsocks protocol (AEAD cipher decryption, proxy listener)
 - **rand**: Random backend selection
 - **tracing**: Structured logging
 - **serde/serde_json**: JSON serialization

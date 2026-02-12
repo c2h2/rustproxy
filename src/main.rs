@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 mod tcp_proxy;
 mod http_proxy;
 mod socks5_proxy;
+mod ss_proxy;
 mod connection_cache;
 pub mod stats;
 pub mod manager;
@@ -20,13 +21,14 @@ mod test_utils;
 use tcp_proxy::TcpProxy;
 use http_proxy::HttpProxy;
 use socks5_proxy::Socks5Proxy;
+use ss_proxy::SsProxy;
 use connection_cache::parse_cache_size;
 use lb::LbAlgorithm;
 
 fn print_usage() {
     println!("Usage:");
     println!("  rustproxy --manager [--listen <address:port>]");
-    println!("  rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5> [options]");
+    println!("  rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5|ss> [options]");
     println!();
     println!("Manager Mode:");
     println!("  --manager                    Start in manager mode (default: 127.0.0.1:13337)");
@@ -36,10 +38,13 @@ fn print_usage() {
     println!("  --listen <address:port>      Address to listen on");
     println!("  --target <address:port>      Address to proxy to (required for tcp mode only)");
     println!("                               Comma-separated for load balancing (tcp mode)");
-    println!("  --mode <tcp|http|socks5>     Proxy mode");
+    println!("  --mode <tcp|http|socks5|ss>  Proxy mode");
     println!("  --cache-size <size>          Connection cache size (default: 64mb)");
     println!("                               Examples: 0, none, 256kb, 1mb, 8mb");
     println!("  --socks5-auth <user:pass>    SOCKS5 authentication (optional)");
+    println!("  --ss-password <password>     Shadowsocks pre-shared key (required for ss mode)");
+    println!("  --ss-method <cipher>         Shadowsocks cipher (default: aes-256-gcm)");
+    println!("                               Supported: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
@@ -58,6 +63,7 @@ fn print_usage() {
     println!("  rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --manager-addr 127.0.0.1:14337");
     println!("  rustproxy --listen 127.0.0.1:8080 --mode http");
     println!("  rustproxy --listen 127.0.0.1:1080 --mode socks5 --socks5-auth user:password");
+    println!("  rustproxy --listen 0.0.0.0:8388 --mode ss --ss-password mypassword --ss-method aes-256-gcm");
     println!();
     println!("Load Balancing Example:");
     println!("  rustproxy --listen 127.0.0.1:8080 \\");
@@ -146,6 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut healthcheck_enabled = false;
     let mut traffic_log_path = String::from("./rustproxy_traffic.csv");
     let mut buffer_size_str = None;
+    let mut ss_password = None;
+    let mut ss_method = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -230,6 +238,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--ss-password" => {
+                if i + 1 < args.len() {
+                    ss_password = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--ss-method" => {
+                if i + 1 < args.len() {
+                    ss_method = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             "--healthcheck" => {
                 healthcheck_enabled = true;
                 i += 1;
@@ -271,8 +295,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if mode != "tcp" && mode != "http" && mode != "socks5" {
-        eprintln!("Mode must be 'tcp', 'http', or 'socks5'");
+    if mode != "tcp" && mode != "http" && mode != "socks5" && mode != "ss" {
+        eprintln!("Mode must be 'tcp', 'http', 'socks5', or 'ss'");
+        std::process::exit(1);
+    }
+
+    // Validate SS mode requirements
+    if mode == "ss" && ss_password.is_none() {
+        eprintln!("--ss-password is required for --mode ss");
         std::process::exit(1);
     }
 
@@ -330,10 +360,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Starting SOCKS5 proxy on {} (cache: {})", listen, cache_display);
         }
         "tcp" => {
-            info!("Starting {} proxy: {} -> {} (cache: {})", mode, listen, target.as_ref().unwrap(), cache_display);
+            if ss_password.is_some() {
+                let method_str = ss_method.as_deref().unwrap_or("aes-256-gcm");
+                info!("Starting SS+TCP proxy on {} -> {} (SS method: {}, cache: {})", listen, target.as_ref().unwrap(), method_str, cache_display);
+            } else {
+                info!("Starting {} proxy: {} -> {} (cache: {})", mode, listen, target.as_ref().unwrap(), cache_display);
+            }
         }
         "http" => {
             info!("Starting {} proxy on {} (cache: {})", mode, listen, cache_display);
+        }
+        "ss" => {
+            let method_str = ss_method.as_deref().unwrap_or("aes-256-gcm");
+            info!("Starting Shadowsocks proxy on {} (method: {})", listen, method_str);
         }
         _ => unreachable!(),
     }
@@ -341,6 +380,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode.as_str() {
         "tcp" => {
             let target = target.unwrap();
+
+            // Parse SS config once (used by both LB and single-target)
+            let ss_cfg = if let Some(ref ss_pw) = ss_password {
+                use shadowsocks::crypto::CipherKind;
+                let method_str = ss_method.as_deref().unwrap_or("aes-256-gcm");
+                let method: CipherKind = match method_str.parse() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        eprintln!("Unsupported SS cipher: {}. Use aes-128-gcm, aes-256-gcm, or chacha20-ietf-poly1305", method_str);
+                        std::process::exit(1);
+                    }
+                };
+                Some((ss_pw.clone(), method))
+            } else {
+                None
+            };
 
             // Determine if we're in load-balancing mode
             let is_lb_mode = target.contains(',') || lb_algorithm.is_some();
@@ -366,7 +421,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
+                let mut proxy = TcpProxy::with_lb(&listen, lb.clone(), cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
+                if let Some((ref pw, method)) = ss_cfg {
+                    proxy.set_ss_config(pw.clone(), method);
+                }
 
                 // Load persistent traffic log
                 let tlog = Arc::new(traffic_log::TrafficLog::load(std::path::Path::new(&traffic_log_path)));
@@ -415,8 +473,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(e);
                 }
             } else {
-                // Single-target mode (unchanged)
-                let proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
+                // Single-target mode
+                let mut proxy = TcpProxy::with_stats(&listen, &target, cache_size_bytes, manager_socket_addr, max_connections, buffer_size_bytes);
+                if let Some((pw, method)) = ss_cfg {
+                    proxy.set_ss_config(pw, method);
+                }
                 if let Err(e) = proxy.start().await {
                     error!("TCP proxy error: {}", e);
                     return Err(e);
@@ -445,6 +506,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Err(e) = proxy.start().await {
                 error!("SOCKS5 proxy error: {}", e);
+                return Err(e);
+            }
+        }
+        "ss" => {
+            use shadowsocks::crypto::CipherKind;
+
+            let method_str = ss_method.unwrap_or_else(|| "aes-256-gcm".to_string());
+            let method: CipherKind = match method_str.parse() {
+                Ok(m) => m,
+                Err(_) => {
+                    eprintln!("Unsupported SS cipher: {}. Use aes-128-gcm, aes-256-gcm, or chacha20-ietf-poly1305", method_str);
+                    std::process::exit(1);
+                }
+            };
+
+            let proxy = SsProxy::with_stats(
+                &listen,
+                ss_password.unwrap(),
+                method,
+                manager_socket_addr,
+                buffer_size_bytes,
+            );
+
+            if let Err(e) = proxy.start().await {
+                error!("Shadowsocks proxy error: {}", e);
                 return Err(e);
             }
         }

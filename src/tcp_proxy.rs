@@ -14,6 +14,11 @@ use crate::connection_cache::ConnectionCache;
 use crate::lb::LoadBalancer;
 use crate::stats::StatsCollector;
 
+use shadowsocks::config::{ServerConfig, ServerType};
+use shadowsocks::context::Context;
+use shadowsocks::crypto::CipherKind;
+use shadowsocks::relay::tcprelay::proxy_listener::ProxyListener;
+
 /* ---------- Optional socket2 for portable TCP keepalive ---------- */
 #[cfg(any(unix, windows))]
 use socket2::{SockRef, TcpKeepalive};
@@ -49,6 +54,9 @@ pub struct TcpProxy {
 
     // Server→client relay buffer size (duplex pipe capacity)
     buffer_size: usize,
+
+    // Optional Shadowsocks listener encryption (password, cipher)
+    ss_config: Option<(String, CipherKind)>,
 }
 
 impl TcpProxy {
@@ -68,6 +76,7 @@ impl TcpProxy {
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: None,
             buffer_size,
+            ss_config: None,
         }
     }
 
@@ -95,6 +104,7 @@ impl TcpProxy {
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: None,
             buffer_size,
+            ss_config: None,
         }
     }
 
@@ -122,7 +132,12 @@ impl TcpProxy {
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: Some(lb),
             buffer_size,
+            ss_config: None,
         }
+    }
+
+    pub fn set_ss_config(&mut self, password: String, method: CipherKind) {
+        self.ss_config = Some((password, method));
     }
 
     pub fn max_connections(&self) -> usize {
@@ -189,95 +204,192 @@ impl TcpProxy {
         // Periodic reporter (warn! with port + uptime + totals + last-5m IPs)
         self.spawn_periodic_reporter();
 
-        loop {
-            match listener.accept().await {
-                Ok((inbound, client_addr)) => {
-                    let current = self.active_connections.load(Ordering::Relaxed);
-                    if current >= self.max_connections {
-                        warn!(
-                            "Connection limit reached ({}/{}), rejecting connection from {}",
-                            current, self.max_connections, client_addr
-                        );
-                        drop(inbound);
-                        continue;
-                    }
+        if let Some((ref password, method)) = self.ss_config {
+            // ---- Shadowsocks-encrypted listener ----
+            // Drop the plain listener; ProxyListener will bind its own
+            drop(listener);
+            let context = Context::new_shared(ServerType::Server);
+            let svr_cfg = ServerConfig::new(local_addr, password.as_str(), method)
+                .map_err(|e| format!("Invalid SS config: {}", e))?;
+            let ss_listener = ProxyListener::bind(context, &svr_cfg).await
+                .map_err(|e| format!("Failed to bind SS listener: {}", e))?;
+            info!("Accepting Shadowsocks connections (method: {:?})", method);
 
-                    // Record recent connection for last-5m stats
-                    {
-                        let recent = self.recent_conns.clone();
-                        let ip = client_addr.ip();
+            loop {
+                match ss_listener.accept().await {
+                    Ok((stream, client_addr)) => {
+                        let current = self.active_connections.load(Ordering::Relaxed);
+                        if current >= self.max_connections {
+                            warn!(
+                                "Connection limit reached ({}/{}), rejecting {}",
+                                current, self.max_connections, client_addr
+                            );
+                            drop(stream);
+                            continue;
+                        }
+
+                        {
+                            let recent = self.recent_conns.clone();
+                            let ip = client_addr.ip();
+                            tokio::spawn(async move {
+                                let mut v = recent.lock().await;
+                                v.push((Instant::now(), ip));
+                            });
+                        }
+
+                        let (target_addr, backend) = if let Some(ref lb) = self.lb {
+                            match lb.next_backend() {
+                                Some(b) => (b.addr.to_string(), Some(b)),
+                                None => {
+                                    warn!("All backends disabled, rejecting {}", client_addr);
+                                    drop(stream);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            (self.target_addr.clone(), None)
+                        };
+
+                        let cache = self.cache.clone();
+                        let stats = self.stats.clone();
+                        let active_connections = self.active_connections.clone();
+                        let total_tx_bytes = self.total_tx_bytes.clone();
+                        let total_rx_bytes = self.total_rx_bytes.clone();
+                        let buffer_size = self.buffer_size;
+
+                        active_connections.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref b) = backend {
+                            b.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                            b.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                        }
+
                         tokio::spawn(async move {
-                            let mut v = recent.lock().await;
-                            v.push((Instant::now(), ip));
+                            let mut stream = stream;
+                            let result = match stream.handshake().await {
+                                Ok(_target_addr) => {
+                                    // Ignore SS target; relay to LB backend
+                                    Self::connect_and_relay(
+                                        stream, client_addr, target_addr,
+                                        cache, stats, total_tx_bytes, total_rx_bytes, buffer_size,
+                                    ).await
+                                }
+                                Err(e) => {
+                                    debug!("SS handshake failed from {}: {}", client_addr, e);
+                                    Err(e.into())
+                                }
+                            };
+
+                            if let Some(ref b) = backend {
+                                match &result {
+                                    Ok((tx, rx)) => {
+                                        b.stats.total_tx_bytes.fetch_add(*tx, Ordering::Relaxed);
+                                        b.stats.total_rx_bytes.fetch_add(*rx, Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                        b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            if let Err(e) = result {
+                                debug!("SS connection from {} error: {}", client_addr, e);
+                            }
+                            active_connections.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
-
-                    // Resolve target: either from LB or fixed single target
-                    let (target_addr, backend) = if let Some(ref lb) = self.lb {
-                        match lb.next_backend() {
-                            Some(b) => (b.addr.to_string(), Some(b)),
-                            None => {
-                                warn!("All backends disabled, rejecting connection from {}", client_addr);
-                                drop(inbound);
-                                continue;
-                            }
-                        }
-                    } else {
-                        (self.target_addr.clone(), None)
-                    };
-
-                    let cache = self.cache.clone();
-                    let stats = self.stats.clone();
-                    let active_connections = self.active_connections.clone();
-                    let total_tx_bytes = self.total_tx_bytes.clone();
-                    let total_rx_bytes = self.total_rx_bytes.clone();
-                    let buffer_size = self.buffer_size;
-
-                    active_connections.fetch_add(1, Ordering::Relaxed);
-
-                    // Per-backend stats: increment active + total connections
-                    if let Some(ref b) = backend {
-                        b.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-                        b.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+                    Err(e) => {
+                        error!("Failed to accept SS connection: {}", e);
+                        sleep(Duration::from_millis(100)).await;
                     }
+                }
+            }
+        } else {
+            // ---- Plain TCP listener ----
+            loop {
+                match listener.accept().await {
+                    Ok((inbound, client_addr)) => {
+                        let current = self.active_connections.load(Ordering::Relaxed);
+                        if current >= self.max_connections {
+                            warn!(
+                                "Connection limit reached ({}/{}), rejecting connection from {}",
+                                current, self.max_connections, client_addr
+                            );
+                            drop(inbound);
+                            continue;
+                        }
 
-                    tokio::spawn(async move {
-                        let result = Self::handle_connection_with_cache(
-                            inbound,
-                            client_addr,
-                            target_addr,
-                            cache,
-                            stats,
-                            active_connections.clone(),
-                            total_tx_bytes,
-                            total_rx_bytes,
-                            buffer_size,
-                        )
-                        .await;
+                        {
+                            let recent = self.recent_conns.clone();
+                            let ip = client_addr.ip();
+                            tokio::spawn(async move {
+                                let mut v = recent.lock().await;
+                                v.push((Instant::now(), ip));
+                            });
+                        }
 
-                        // Update per-backend stats
-                        if let Some(ref b) = backend {
-                            match &result {
-                                Ok((tx, rx)) => {
-                                    b.stats.total_tx_bytes.fetch_add(*tx, Ordering::Relaxed);
-                                    b.stats.total_rx_bytes.fetch_add(*rx, Ordering::Relaxed);
-                                }
-                                Err(_) => {
-                                    b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                        let (target_addr, backend) = if let Some(ref lb) = self.lb {
+                            match lb.next_backend() {
+                                Some(b) => (b.addr.to_string(), Some(b)),
+                                None => {
+                                    warn!("All backends disabled, rejecting connection from {}", client_addr);
+                                    drop(inbound);
+                                    continue;
                                 }
                             }
-                            b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                        } else {
+                            (self.target_addr.clone(), None)
+                        };
+
+                        let cache = self.cache.clone();
+                        let stats = self.stats.clone();
+                        let active_connections = self.active_connections.clone();
+                        let total_tx_bytes = self.total_tx_bytes.clone();
+                        let total_rx_bytes = self.total_rx_bytes.clone();
+                        let buffer_size = self.buffer_size;
+
+                        active_connections.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref b) = backend {
+                            b.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                            b.stats.total_connections.fetch_add(1, Ordering::Relaxed);
                         }
 
-                        if let Err(e) = result {
-                            error!("Error handling connection from {}: {}", client_addr, e);
-                        }
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                    sleep(Duration::from_millis(100)).await;
+                        tokio::spawn(async move {
+                            let result = Self::handle_connection_with_cache(
+                                inbound,
+                                client_addr,
+                                target_addr,
+                                cache,
+                                stats,
+                                active_connections.clone(),
+                                total_tx_bytes,
+                                total_rx_bytes,
+                                buffer_size,
+                            )
+                            .await;
+
+                            if let Some(ref b) = backend {
+                                match &result {
+                                    Ok((tx, rx)) => {
+                                        b.stats.total_tx_bytes.fetch_add(*tx, Ordering::Relaxed);
+                                        b.stats.total_rx_bytes.fetch_add(*rx, Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                        b.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                b.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                            }
+
+                            if let Err(e) = result {
+                                error!("Error handling connection from {}: {}", client_addr, e);
+                            }
+                            active_connections.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                        sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }
@@ -353,6 +465,35 @@ impl TcpProxy {
         total_rx_bytes: Arc<AtomicU64>,
         buffer_size: usize,
     ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        // TCP-specific inbound tuning
+        let _ = inbound.set_nodelay(true);
+        #[cfg(any(unix, windows))]
+        {
+            let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
+            let _ = SockRef::from(&inbound).set_tcp_keepalive(&ka);
+        }
+
+        Self::connect_and_relay(
+            inbound, client_addr, target_addr, cache, stats,
+            total_tx_bytes, total_rx_bytes, buffer_size,
+        ).await
+    }
+
+    /// Generic relay: connect to target backend and pump data bidirectionally.
+    /// Works with any inbound stream (plain TCP or decrypted SS).
+    pub async fn connect_and_relay<S>(
+        inbound: S,
+        client_addr: SocketAddr,
+        target_addr: String,
+        cache: ConnectionCache,
+        stats: Option<Arc<StatsCollector>>,
+        total_tx_bytes: Arc<AtomicU64>,
+        total_rx_bytes: Arc<AtomicU64>,
+        buffer_size: usize,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // Create stats connection ID if stats are enabled
         let conn_id = if let Some(ref stats) = stats {
             Some(stats.new_connection(client_addr, target_addr.clone()).await)
@@ -388,22 +529,18 @@ impl TcpProxy {
             }
         };
 
-        // Latency/health hints
-        let _ = inbound.set_nodelay(true);
+        // Outbound TCP tuning
         let _ = outbound.set_nodelay(true);
-
-        // Configure TCP keepalive (portable via socket2)
         #[cfg(any(unix, windows))]
         {
             let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
-            let _ = SockRef::from(&inbound).set_tcp_keepalive(&ka);
             let _ = SockRef::from(&outbound).set_tcp_keepalive(&ka);
         }
 
         info!("Proxying connection from {} to {}", client_addr, target_addr);
 
-        // Split and pump both directions (owned halves for tokio::spawn)
-        let (ri, wi) = inbound.into_split();
+        // Split inbound (generic) and outbound (TcpStream)
+        let (ri, wi) = tokio::io::split(inbound);
         let (ro, wo) = outbound.into_split();
 
         // Client→Server: direct pump (no buffering needed)
@@ -421,13 +558,11 @@ impl TcpProxy {
             Ok(n) => (n, None),
             Err(pe) => (pe.bytes, Some(pe.source)),
         };
-        // s2buf gives bytes read from server (written into duplex)
         let (_bytes_into_buf, e_s2buf) = match r_s2buf {
             Ok(Ok(n)) => (n, None),
             Ok(Err(pe)) => (pe.bytes, Some(pe.source)),
             Err(je) => (0, Some(io::Error::new(io::ErrorKind::Other, je))),
         };
-        // buf2c gives bytes delivered to client
         let (bytes_to_client, e_buf2c) = match r_buf2c {
             Ok(n) => (n, None),
             Err(pe) => (pe.bytes, Some(pe.source)),

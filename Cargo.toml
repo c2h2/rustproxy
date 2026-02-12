@@ -22,6 +22,7 @@ dashmap = "5.5"
 socket2 = "0.6.0"
 rand = "0.8"
 rlimit = "0.10"
+shadowsocks = { version = "1.24", features = ["aead-cipher-2022"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
