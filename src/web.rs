@@ -35,6 +35,7 @@ pub struct WebState {
     pub ss_listen_port: String,
     pub vmess_mode: bool,
     pub vmess_listen_port: String,
+    pub cmdline_args: String,
 }
 
 /* ------------------------------ JSON types ------------------------------ */
@@ -61,6 +62,7 @@ struct StatsResponse {
     vmess_mode: bool,
     vmess_listen_port: String,
     version: String,
+    cmdline_args: String,
 }
 
 #[derive(Serialize)]
@@ -118,6 +120,7 @@ async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         vmess_mode: state.vmess_mode,
         vmess_listen_port: state.vmess_listen_port.clone(),
         version: VERSION.to_string(),
+        cmdline_args: state.cmdline_args.clone(),
     })
 }
 

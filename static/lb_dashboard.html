@@ -133,6 +133,7 @@
         </div>
 
         <div class="mt-4 text-center text-gray-600 text-xs">
+            <div id="cmdline-args" class="mb-2 font-mono text-gray-500"></div>
             Auto-refreshing every 2s &mdash; RustProxy Load Balancer Dashboard &mdash; <span id="version"></span>
         </div>
     </div>
@@ -463,6 +464,7 @@
                 }
 
                 if (data.version) document.getElementById('version').textContent = data.version;
+                if (data.cmdline_args) document.getElementById('cmdline-args').textContent = data.cmdline_args;
 
                 renderBackends(data.backends);
             } catch (e) {

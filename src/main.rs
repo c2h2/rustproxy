@@ -125,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let args: Vec<String> = env::args().collect();
+    let cmdline_args = args.iter().skip(1).map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
 
     if args.len() < 2 {
         print_usage();
@@ -529,6 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ss_listen_port: ss_listen_addr_str,
                         vmess_mode: vmess_listen_port.is_some(),
                         vmess_listen_port: vmess_listen_addr_str,
+                        cmdline_args: cmdline_args.clone(),
                     });
                     tokio::spawn(web::start_web_interface(web_bind, web_state));
                 }

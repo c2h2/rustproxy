@@ -38,6 +38,7 @@ async fn start_test_web_server() -> (String, Arc<WebState>) {
         ss_listen_port: String::new(),
         vmess_mode: false,
         vmess_listen_port: String::new(),
+        cmdline_args: String::new(),
     });
 
     let app = build_router(state.clone());
