@@ -237,8 +237,9 @@ async fn api_connections(State(state): State<Arc<WebState>>) -> impl IntoRespons
 
 /* ------------------------------ Server ------------------------------ */
 
-pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
-    let app = Router::new()
+/// Build the axum Router with all API routes. Exposed for integration tests.
+pub fn build_router(state: Arc<WebState>) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/api/backends", get(api_backends))
         .route("/api/backends/:id/enable", post(api_enable_backend))
@@ -248,7 +249,11 @@ pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
         .route("/api/health", get(api_health))
         .route("/api/traffic/history", get(api_traffic_history))
         .route("/api/traffic/dates", get(api_traffic_dates))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn start_web_interface(bind_addr: String, state: Arc<WebState>) {
+    let app = build_router(state);
 
     info!("LB dashboard listening on http://{}", bind_addr);
 
