@@ -43,7 +43,7 @@ pub struct BackendStats {
     pub total_errors: AtomicU64,
     /// Healthcheck response time in milliseconds (0 if error/timeout/never checked)
     pub hc_response_ms: AtomicU64,
-    /// Healthcheck status: 0=unknown, 1=ok, 2=error, 3=timeout
+    /// Healthcheck status: 0=unknown, 1=ok, 2=error, 3=timeout, 4=admin_disabled
     pub hc_status: AtomicU64,
     /// Last healthcheck epoch seconds (0=never)
     pub hc_last_check_epoch: AtomicU64,
@@ -70,6 +70,8 @@ pub struct Backend {
     pub id: usize,
     pub addr: SocketAddr,
     pub enabled: AtomicBool,
+    /// When true, the backend was manually disabled by an admin and health checks must not re-enable it.
+    pub admin_disabled: AtomicBool,
     pub stats: BackendStats,
 }
 
@@ -79,6 +81,7 @@ impl Backend {
             id,
             addr,
             enabled: AtomicBool::new(true),
+            admin_disabled: AtomicBool::new(false),
             stats: BackendStats::new(),
         }
     }
@@ -91,6 +94,7 @@ pub struct BackendSnapshot {
     pub id: usize,
     pub addr: String,
     pub enabled: bool,
+    pub admin_disabled: bool,
     pub total_connections: u64,
     pub active_connections: usize,
     pub total_tx_bytes: u64,
@@ -160,7 +164,9 @@ impl LoadBalancer {
 
     pub fn enable_backend(&self, id: usize) -> bool {
         if let Some(b) = self.backends.iter().find(|b| b.id == id) {
+            b.admin_disabled.store(false, Ordering::Relaxed);
             b.enabled.store(true, Ordering::Relaxed);
+            b.stats.hc_status.store(0, Ordering::Relaxed); // reset to unknown
             true
         } else {
             false
@@ -169,7 +175,9 @@ impl LoadBalancer {
 
     pub fn disable_backend(&self, id: usize) -> bool {
         if let Some(b) = self.backends.iter().find(|b| b.id == id) {
+            b.admin_disabled.store(true, Ordering::Relaxed);
             b.enabled.store(false, Ordering::Relaxed);
+            b.stats.hc_status.store(4, Ordering::Relaxed); // admin_disabled
             true
         } else {
             false
@@ -184,6 +192,7 @@ impl LoadBalancer {
                 id: b.id,
                 addr: b.addr.to_string(),
                 enabled: b.enabled.load(Ordering::Relaxed),
+                admin_disabled: b.admin_disabled.load(Ordering::Relaxed),
                 total_connections: b.stats.total_connections.load(Ordering::Relaxed),
                 active_connections: b.stats.active_connections.load(Ordering::Relaxed),
                 total_tx_bytes: b.stats.total_tx_bytes.load(Ordering::Relaxed),

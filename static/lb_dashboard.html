@@ -176,6 +176,7 @@
                 case 1: return '<span class="text-green-400 font-medium">' + b.hc_response_ms + 'ms</span>';
                 case 2: return '<span class="text-red-400 font-medium">error</span>';
                 case 3: return '<span class="text-yellow-400 font-medium">timeout</span>';
+                case 4: return '<span class="text-purple-400 font-medium">admin down</span>';
                 default: return '<span class="text-gray-500">-</span>';
             }
         }
@@ -208,15 +209,16 @@
             backends.forEach(b => {
                 const hasErrors = b.total_errors > 0;
                 const hcFail = !b.enabled && (b.hc_status === 2 || b.hc_status === 3);
+                const adminDown = b.hc_status === 4;
                 const statusColor = b.enabled
                     ? (hasErrors ? 'bg-yellow-500' : 'bg-green-500')
-                    : 'bg-red-500';
-                const statusText = b.enabled ? 'UP' : (hcFail ? 'PING FAIL' : 'DISABLED');
+                    : (adminDown ? 'bg-purple-500' : 'bg-red-500');
+                const statusText = b.enabled ? 'UP' : (adminDown ? 'ADMIN DOWN' : (hcFail ? 'PING FAIL' : 'DISABLED'));
                 const statusBadge = b.enabled
                     ? (hasErrors
                         ? 'bg-yellow-900 text-yellow-200'
                         : 'bg-green-900 text-green-200')
-                    : 'bg-red-900 text-red-200';
+                    : (adminDown ? 'bg-purple-900 text-purple-200' : 'bg-red-900 text-red-200');
                 const btnLabel = b.enabled ? 'Disable' : 'Enable';
                 const btnClass = b.enabled
                     ? 'bg-red-600 hover:bg-red-700'

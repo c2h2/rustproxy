@@ -176,27 +176,41 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
                     HealthCheckResult::Ok(ms) => {
                         all_failed = false;
                         backend.stats.hc_response_ms.store(ms, Ordering::Relaxed);
-                        backend.stats.hc_status.store(1, Ordering::Relaxed); // ok
-                        if !backend.enabled.load(Ordering::Relaxed) {
+                        if backend.admin_disabled.load(Ordering::Relaxed) {
+                            // Keep hc_status=4 (admin_disabled), don't re-enable
+                            info!(
+                                "[healthcheck] backend {} ({}) healthy ({}ms) but kept disabled by admin",
+                                i, addr, ms
+                            );
+                        } else if !backend.enabled.load(Ordering::Relaxed) {
+                            backend.stats.hc_status.store(1, Ordering::Relaxed);
                             backend.enabled.store(true, Ordering::Relaxed);
                             info!(
                                 "[healthcheck] backend {} ({}) recovered, re-enabled ({}ms)",
                                 i, addr, ms
                             );
                         } else {
+                            backend.stats.hc_status.store(1, Ordering::Relaxed);
                             info!("[healthcheck] backend {} ({}) OK ({}ms)", i, addr, ms);
                         }
                     }
                     HealthCheckResult::Error(msg) => {
                         backend.stats.hc_response_ms.store(0, Ordering::Relaxed);
-                        backend.stats.hc_status.store(2, Ordering::Relaxed); // error
-                        if backend.enabled.load(Ordering::Relaxed) {
+                        if backend.admin_disabled.load(Ordering::Relaxed) {
+                            // Keep hc_status=4 (admin_disabled)
+                            info!(
+                                "[healthcheck] backend {} ({}) admin-disabled, hc error: {}",
+                                i, addr, msg
+                            );
+                        } else if backend.enabled.load(Ordering::Relaxed) {
+                            backend.stats.hc_status.store(2, Ordering::Relaxed);
                             backend.enabled.store(false, Ordering::Relaxed);
                             warn!(
                                 "[healthcheck] backend {} ({}) FAILED: {}, disabled",
                                 i, addr, msg
                             );
                         } else {
+                            backend.stats.hc_status.store(2, Ordering::Relaxed);
                             warn!(
                                 "[healthcheck] backend {} ({}) still failing: {}",
                                 i, addr, msg
@@ -205,14 +219,21 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
                     }
                     HealthCheckResult::Timeout => {
                         backend.stats.hc_response_ms.store(0, Ordering::Relaxed);
-                        backend.stats.hc_status.store(3, Ordering::Relaxed); // timeout
-                        if backend.enabled.load(Ordering::Relaxed) {
+                        if backend.admin_disabled.load(Ordering::Relaxed) {
+                            // Keep hc_status=4 (admin_disabled)
+                            info!(
+                                "[healthcheck] backend {} ({}) admin-disabled, hc timeout",
+                                i, addr
+                            );
+                        } else if backend.enabled.load(Ordering::Relaxed) {
+                            backend.stats.hc_status.store(3, Ordering::Relaxed);
                             backend.enabled.store(false, Ordering::Relaxed);
                             warn!(
                                 "[healthcheck] backend {} ({}) TIMEOUT, disabled",
                                 i, addr
                             );
                         } else {
+                            backend.stats.hc_status.store(3, Ordering::Relaxed);
                             warn!(
                                 "[healthcheck] backend {} ({}) still timing out",
                                 i, addr
@@ -222,15 +243,22 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
                 }
             }
 
-            // Safety valve: if ALL backends failed, re-enable all
+            // Safety valve: if ALL backends failed, re-enable all (except admin-disabled)
             if all_failed && count > 0 {
-                warn!(
-                    "[healthcheck] ALL {} backends failed! Re-enabling all as safety valve.",
-                    count
-                );
+                let mut re_enabled = 0usize;
+                let mut skipped = 0usize;
                 for backend in backends.iter() {
-                    backend.enabled.store(true, Ordering::Relaxed);
+                    if backend.admin_disabled.load(Ordering::Relaxed) {
+                        skipped += 1;
+                    } else {
+                        backend.enabled.store(true, Ordering::Relaxed);
+                        re_enabled += 1;
+                    }
                 }
+                warn!(
+                    "[healthcheck] ALL {} backends failed! Re-enabled {} as safety valve ({} kept admin-disabled).",
+                    count, re_enabled, skipped
+                );
             }
 
             tokio::time::sleep(Duration::from_secs(60)).await;
