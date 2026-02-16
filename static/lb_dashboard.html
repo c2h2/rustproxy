@@ -133,7 +133,7 @@
         </div>
 
         <div class="mt-4 text-center text-gray-600 text-xs">
-            Auto-refreshing every 2s &mdash; RustProxy Load Balancer Dashboard
+            Auto-refreshing every 2s &mdash; RustProxy Load Balancer Dashboard &mdash; <span id="version"></span>
         </div>
     </div>
 
@@ -461,6 +461,8 @@
                     ssLabel.className = 'text-lg font-bold text-gray-400 mt-1';
                     ssCard.className = 'bg-gray-800 rounded-lg p-4 border border-gray-700';
                 }
+
+                if (data.version) document.getElementById('version').textContent = data.version;
 
                 renderBackends(data.backends);
             } catch (e) {

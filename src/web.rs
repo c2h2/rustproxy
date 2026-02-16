@@ -16,6 +16,8 @@ use crate::conn_tracker::ConnectionTracker;
 use crate::lb::LoadBalancer;
 use crate::traffic_log::TrafficLog;
 
+const VERSION: &str = env!("RUSTPROXY_VERSION");
+
 /* ------------------------------ State ------------------------------ */
 
 pub struct WebState {
@@ -58,6 +60,7 @@ struct StatsResponse {
     ss_listen_port: String,
     vmess_mode: bool,
     vmess_listen_port: String,
+    version: String,
 }
 
 #[derive(Serialize)]
@@ -114,6 +117,7 @@ async fn api_stats(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         ss_listen_port: state.ss_listen_port.clone(),
         vmess_mode: state.vmess_mode,
         vmess_listen_port: state.vmess_listen_port.clone(),
+        version: VERSION.to_string(),
     })
 }
 
