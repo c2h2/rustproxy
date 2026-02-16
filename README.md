@@ -1,6 +1,12 @@
 # RustProxy
 
-A high-performance proxy server written in Rust with configurable connection caching.
+A high-performance proxy server written in Rust with configurable connection caching and real-time web dashboard.
+
+![Dashboard Screenshot](docs/screenshot.png)
+
+## Motivation
+
+This project was inspired by the limitations of HAProxy + SOCKS load balancing setups, which proved to be unstable in production environments. Existing solutions lacked robust performance caching and strong backend disable mechanisms. RustProxy was vibe-coded to address these pain points with a focus on stability, performance, and operational visibility.
 
 ## Features
 
@@ -169,14 +175,15 @@ If `--lb` is not specified but multiple targets are given, round-robin is used b
 
 When `--http-interface` is specified, a built-in web dashboard is available with:
 
-- **Summary header**: Listen address, algorithm, uptime, total active connections, aggregate TX/RX
-- **Backend table**: ID, address, status (UP/DISABLED), active connections, total connections, TX, RX, errors
-- **Enable/Disable buttons**: Toggle backends on/off at runtime
-- **Active connections table**: Per-connection client IP, SS target, backend, TX/RX, duration
-- **Recent connections table**: Last 200 closed connections with stats
+- **Summary header**: Listen address, algorithm, uptime, total active connections, aggregate TX/RX, throughput rates
+- **Traffic history graph**: Real-time visualization of TX/RX rates with historical data
+- **Backend table**: ID, address, status (UP/PING FAIL/DISABLED), active connections, total connections, TX, RX, errors, HTTP ping latency
+- **Enable/Disable buttons**: Toggle backends on/off at runtime (admin-controlled disable persists through health checks)
+- **SS Clients section**: View active Shadowsocks client connections with IP addresses and traffic stats
 - **SS mode badge**: Shows cipher method when running in SS+TCP LB mode
 - **Auto-refresh**: Polls `/api/stats` and `/api/connections` every 2 seconds
-- **Color coding**: Green = enabled, Red = disabled, Yellow = has errors
+- **Color coding**: Green = enabled, Red = disabled/failed, Yellow = has errors
+- **24-hour traffic tracking**: Persistent traffic statistics across restarts
 
 ### REST API
 
@@ -214,6 +221,7 @@ When `--healthcheck` is enabled (TCP LB mode only), rustproxy continuously monit
 - **Timeout**: 10 seconds per probe
 - **On success**: Backend stays enabled (or is re-enabled if previously disabled); response time is recorded
 - **On failure/timeout**: Backend is disabled and removed from rotation
+- **Admin override**: Backends manually disabled via API/dashboard stay disabled even if health checks pass
 - **Safety valve**: If ALL backends fail, all are re-enabled to avoid total outage
 - **Dashboard integration**: Healthcheck status and response times are visible in the web dashboard
 
@@ -250,7 +258,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com  # DNS through proxy
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@target.com
 ```
 
-**Firefox:** 
+**Firefox:**
 - Go to Settings → Network Settings → Manual proxy configuration
 - Set SOCKS Host: 127.0.0.1, Port: 1080, SOCKS v5
 
@@ -299,4 +307,13 @@ cargo bench
 
 ## License
 
-[Add your license information here]
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
