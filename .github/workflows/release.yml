@@ -22,6 +22,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             artifact: rustproxy-linux-arm64-musl
+            use_cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: rustproxy-linux-arm64
@@ -42,15 +43,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Install cross-compilation tools (Linux ARM64 musl)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          # Install musl cross compiler for aarch64
-          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf aarch64-linux-musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+      - name: Install cross
+        if: matrix.use_cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Configure linker for aarch64-unknown-linux-gnu
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -58,14 +53,13 @@ jobs:
           mkdir -p .cargo
           printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
 
-      - name: Configure linker for aarch64-unknown-linux-musl
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          mkdir -p .cargo
-          printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' >> .cargo/config.toml
-
       - name: Build release binary
+        if: matrix.use_cross != true
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash
