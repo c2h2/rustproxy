@@ -3,6 +3,7 @@ use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpStream;
 use tracing::{error, info};
 use crate::connection_cache::ConnectionCache;
 use crate::stats::StatsCollector;
@@ -118,18 +119,54 @@ async fn proxy_handler_with_stats(
 
     match req.method() {
         &Method::CONNECT => {
-            // Handle HTTPS CONNECT method
-            let response = Response::builder()
-                .status(200)
-                .body(Body::from("Connection established"))
-                .unwrap();
-            
-            // Close connection in stats
-            if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                stats.close_connection(conn_id).await;
+            // HTTPS CONNECT tunnel: parse host:port, accept the upgrade, and
+            // bidirectionally copy bytes between client and target.
+            let authority = match req.uri().authority() {
+                Some(a) => a.to_string(),
+                None => target_host.clone(),
+            };
+            if !authority.contains(':') {
+                error!("CONNECT request missing port: {}", authority);
+                if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
+                    stats.close_connection(conn_id).await;
+                }
+                return Ok(Response::builder()
+                    .status(400)
+                    .body(Body::from("Bad Request: CONNECT requires host:port"))
+                    .unwrap());
             }
-            
-            Ok(response)
+
+            let stats_clone = stats.clone();
+            let conn_id_clone = conn_id.clone();
+            tokio::spawn(async move {
+                match hyper::upgrade::on(req).await {
+                    Ok(upgraded) => {
+                        match TcpStream::connect(&authority).await {
+                            Ok(mut server) => {
+                                let mut upgraded = upgraded;
+                                match tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
+                                    Ok((from_client, from_server)) => {
+                                        if let (Some(stats), Some(conn_id)) = (&stats_clone, &conn_id_clone) {
+                                            stats.update_connection(conn_id, from_client, from_server).await;
+                                        }
+                                    }
+                                    Err(e) => error!("CONNECT tunnel error for {}: {}", authority, e),
+                                }
+                            }
+                            Err(e) => error!("Failed to connect to {}: {}", authority, e),
+                        }
+                    }
+                    Err(e) => error!("Upgrade error: {}", e),
+                }
+                if let (Some(stats), Some(conn_id)) = (&stats_clone, &conn_id_clone) {
+                    stats.close_connection(conn_id).await;
+                }
+            });
+
+            Ok(Response::builder()
+                .status(200)
+                .body(Body::empty())
+                .unwrap())
         }
         _ => {
             // Handle regular HTTP requests by forwarding to target
