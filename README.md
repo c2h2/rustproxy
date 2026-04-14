@@ -24,6 +24,26 @@ This project was inspired by the limitations of HAProxy + SOCKS load balancing s
 
 ## Installation
 
+### One-line install (recommended)
+
+Downloads the latest release binary into the current directory. Auto-detects
+Linux/macOS and x86_64/arm64.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/c2h2/rustproxy/master/scripts/install.sh | bash
+```
+
+Install elsewhere or pin a version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/c2h2/rustproxy/master/scripts/install.sh | INSTALL_DIR=/usr/local/bin bash
+curl -fsSL https://raw.githubusercontent.com/c2h2/rustproxy/master/scripts/install.sh | VERSION=v1.0.0 bash
+```
+
+Supported targets: `linux-amd64`, `linux-arm64` (musl, static), `macos-arm64`.
+
+### Build from source
+
 Make sure you have Rust installed, then build the project:
 
 ```bash
