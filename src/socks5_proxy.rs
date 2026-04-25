@@ -382,17 +382,30 @@ impl Socks5Proxy {
         let (mut client_read, mut client_write) = client_stream.into_split();
         let (mut target_read, mut target_write) = target_stream.into_split();
 
-        // Client→Target: direct copy (no buffering needed)
-        let client_to_target = tokio::io::copy(&mut client_read, &mut target_write);
+        // Client→Target: copy then half-close target's write side so the
+        // upstream sees FIN and can release any pending response.
+        let client_to_target = async move {
+            let n = tokio::io::copy(&mut client_read, &mut target_write).await?;
+            let _ = target_write.shutdown().await;
+            Ok::<u64, std::io::Error>(n)
+        };
 
         // Target→Client: buffered via duplex pipe so reads from target
-        // are decoupled from slow client writes
+        // are decoupled from slow client writes. Shut down both the duplex
+        // writer (so buf2c sees EOF) and the client write half (so the
+        // client sees FIN) when each stage finishes.
         let buffer_size = self.buffer_size;
         let (mut duplex_w, mut duplex_r) = tokio::io::duplex(buffer_size);
         let t2buf = tokio::spawn(async move {
-            tokio::io::copy(&mut target_read, &mut duplex_w).await
+            let result = tokio::io::copy(&mut target_read, &mut duplex_w).await;
+            let _ = duplex_w.shutdown().await;
+            result
         });
-        let buf2c = tokio::io::copy(&mut duplex_r, &mut client_write);
+        let buf2c = async move {
+            let n = tokio::io::copy(&mut duplex_r, &mut client_write).await?;
+            let _ = client_write.shutdown().await;
+            Ok::<u64, std::io::Error>(n)
+        };
 
         // Use join to capture partial byte counts even on failures
         let (result1, r_t2buf, r_buf2c) = tokio::join!(client_to_target, t2buf, buf2c);
@@ -578,7 +591,74 @@ mod tests {
         
         let mut buffer = [0; 1024];
         let n = client.read(&mut buffer).await.unwrap();
-        
+
         assert_eq!(&buffer[0..n], test_data);
+    }
+
+    /// Regression test: when the upstream closes its side (sends FIN), the
+    /// proxy must propagate that FIN to the client so the client's read
+    /// returns 0 promptly. Before the half-close fix, this hung until TCP
+    /// keepalive (~60s) and the test would time out.
+    #[tokio::test]
+    async fn test_socks5_propagates_upstream_fin() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        // Upstream: accept one connection, write a payload, then close.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let payload: &[u8] = b"upstream-says-bye";
+        tokio::spawn(async move {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            s.write_all(payload).await.unwrap();
+            // Drop closes the socket and sends FIN.
+        });
+
+        let proxy = Socks5Proxy::new("127.0.0.1:0", 128 * 1024, 16 * 1024 * 1024);
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
+                let proxy = proxy.clone();
+                tokio::spawn(async move {
+                    let _ = proxy.handle_connection(inbound, client_addr).await;
+                });
+            }
+        });
+        sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, SOCKS5_NO_AUTH]).await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [SOCKS5_VERSION, SOCKS5_NO_AUTH]);
+
+        let target_ip = match upstream_addr.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => panic!("Expected IPv4 address"),
+        };
+        let mut request = vec![SOCKS5_VERSION, SOCKS5_CMD_CONNECT, 0x00, SOCKS5_ATYP_IPV4];
+        request.extend_from_slice(&target_ip.octets());
+        request.extend_from_slice(&upstream_addr.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response[1], SOCKS5_REP_SUCCESS);
+
+        // read_to_end only returns once the proxy propagates EOF to us.
+        // Cap with a short timeout — TCP keepalive is 60s, so a hang would
+        // blow past this easily.
+        let mut received = Vec::new();
+        let read_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.read_to_end(&mut received),
+        )
+        .await;
+
+        assert!(
+            read_result.is_ok(),
+            "client.read_to_end did not return — proxy failed to propagate upstream FIN"
+        );
+        read_result.unwrap().unwrap();
+        assert_eq!(received, payload);
     }
 }
