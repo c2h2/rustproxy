@@ -205,8 +205,9 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
                         } else if backend.enabled.load(Ordering::Relaxed) {
                             backend.stats.hc_status.store(2, Ordering::Relaxed);
                             backend.enabled.store(false, Ordering::Relaxed);
+                            backend.kill_active();
                             warn!(
-                                "[healthcheck] backend {} ({}) FAILED: {}, disabled",
+                                "[healthcheck] backend {} ({}) FAILED: {}, disabled (killed in-flight)",
                                 i, addr, msg
                             );
                         } else {
@@ -228,8 +229,9 @@ pub fn spawn_healthcheck_task(lb: Arc<LoadBalancer>) {
                         } else if backend.enabled.load(Ordering::Relaxed) {
                             backend.stats.hc_status.store(3, Ordering::Relaxed);
                             backend.enabled.store(false, Ordering::Relaxed);
+                            backend.kill_active();
                             warn!(
-                                "[healthcheck] backend {} ({}) TIMEOUT, disabled",
+                                "[healthcheck] backend {} ({}) TIMEOUT, disabled (killed in-flight)",
                                 i, addr
                             );
                         } else {

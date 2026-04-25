@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use rand::Rng;
 use serde::Serialize;
+use tokio::sync::Notify;
 
 /* ------------------------------ Algorithm ------------------------------ */
 
@@ -73,6 +74,10 @@ pub struct Backend {
     /// When true, the backend was manually disabled by an admin and health checks must not re-enable it.
     pub admin_disabled: AtomicBool,
     pub stats: BackendStats,
+    /// Wakes every active relay pinned to this backend so they can tear down.
+    /// Notify::notify_waiters wakes only currently-registered waiters, so a
+    /// later relay (after the backend recovers) is unaffected.
+    kill_notify: Arc<Notify>,
 }
 
 impl Backend {
@@ -83,7 +88,22 @@ impl Backend {
             enabled: AtomicBool::new(true),
             admin_disabled: AtomicBool::new(false),
             stats: BackendStats::new(),
+            kill_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Returns a future that resolves when this backend is asked to drop
+    /// in-flight connections. Relay loops should race this against their
+    /// copy futures via `tokio::select!`.
+    pub async fn wait_kill(&self) {
+        self.kill_notify.notified().await;
+    }
+
+    /// Wake every relay currently waiting on `wait_kill`. Called when the
+    /// health check transitions a backend from enabled→disabled, or on
+    /// admin disable. Newly-arriving relays after this call are unaffected.
+    pub fn kill_active(&self) {
+        self.kill_notify.notify_waiters();
     }
 }
 
@@ -178,6 +198,7 @@ impl LoadBalancer {
             b.admin_disabled.store(true, Ordering::Relaxed);
             b.enabled.store(false, Ordering::Relaxed);
             b.stats.hc_status.store(4, Ordering::Relaxed); // admin_disabled
+            b.kill_active();
             true
         } else {
             false
@@ -211,5 +232,58 @@ impl LoadBalancer {
 
     pub fn backends(&self) -> &[Arc<Backend>] {
         &self.backends
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `kill_active()` must wake every task currently in `wait_kill()`,
+    /// and a fresh `wait_kill()` registered after the notify must not
+    /// see the previous notification (otherwise reused backends would
+    /// kill new connections).
+    #[tokio::test]
+    async fn kill_active_wakes_only_current_waiters() {
+        let backend = Arc::new(Backend::new(0, "127.0.0.1:1".parse().unwrap()));
+
+        let b1 = backend.clone();
+        let waiter = tokio::spawn(async move { b1.wait_kill().await });
+
+        // Give the waiter a moment to register.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        backend.kill_active();
+
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter did not wake on kill_active")
+            .unwrap();
+
+        // A new wait registered AFTER the notify must not fire spontaneously.
+        let b2 = backend.clone();
+        let late = tokio::spawn(async move { b2.wait_kill().await });
+        let result = tokio::time::timeout(Duration::from_millis(100), late).await;
+        assert!(
+            result.is_err(),
+            "wait_kill registered after notify should not have fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_backend_kills_active() {
+        let lb = LoadBalancer::new("127.0.0.1:1", LbAlgorithm::RoundRobin).unwrap();
+        let backend = lb.backends()[0].clone();
+
+        let b1 = backend.clone();
+        let waiter = tokio::spawn(async move { b1.wait_kill().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(lb.disable_backend(0));
+
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("disable_backend did not propagate kill")
+            .unwrap();
     }
 }

@@ -339,14 +339,22 @@ impl TcpProxy {
                                                         backend.stats.total_connections.fetch_add(1, Ordering::Relaxed);
                                                         backend_ref = Some(backend);
 
+                                                        let backend_for_kill = backend_ref.clone().unwrap();
                                                         match parse_host_port(&target_addr) {
                                                             Ok((host, port)) => {
                                                                 match socks5_connect(&backend_addr, &host, port).await {
                                                                     Ok(outbound) => {
-                                                                        relay_streams(
+                                                                        let relay = relay_streams(
                                                                             stream, outbound, client_addr, &target_addr,
                                                                             total_tx_bytes, total_rx_bytes, buffer_size,
-                                                                        ).await
+                                                                        );
+                                                                        tokio::select! {
+                                                                            r = relay => r,
+                                                                            _ = backend_for_kill.wait_kill() => {
+                                                                                warn!("SS conn {} dropped: backend {} marked unhealthy", client_addr, backend_addr);
+                                                                                Err("backend marked unhealthy".into())
+                                                                            }
+                                                                        }
                                                                     }
                                                                     Err(e) => {
                                                                         error!("SOCKS5 connect via {} to {} failed: {}", backend_addr, target_addr, e);
@@ -498,6 +506,7 @@ impl TcpProxy {
                                                         backend.stats.total_connections.fetch_add(1, Ordering::Relaxed);
                                                         backend_ref = Some(backend);
 
+                                                        let backend_for_kill = backend_ref.clone().unwrap();
                                                         match parse_host_port(&target_addr) {
                                                             Ok((host, port)) => {
                                                                 match socks5_connect(&backend_addr, &host, port).await {
@@ -506,10 +515,17 @@ impl TcpProxy {
                                                                         let (vmess_read, vmess_write) = vmess_stream.into_async_rw();
                                                                         // Combine into a single stream for relay
                                                                         let combined = tokio::io::join(vmess_read, vmess_write);
-                                                                        relay_streams(
+                                                                        let relay = relay_streams(
                                                                             combined, outbound, client_addr, &target_addr,
                                                                             total_tx_bytes, total_rx_bytes, buffer_size,
-                                                                        ).await
+                                                                        );
+                                                                        tokio::select! {
+                                                                            r = relay => r,
+                                                                            _ = backend_for_kill.wait_kill() => {
+                                                                                warn!("VMess conn {} dropped: backend {} marked unhealthy", client_addr, backend_addr);
+                                                                                Err("backend marked unhealthy".into())
+                                                                            }
+                                                                        }
                                                                     }
                                                                     Err(e) => {
                                                                         error!("SOCKS5 connect via {} to {} failed: {}", backend_addr, target_addr, e);
@@ -1057,7 +1073,8 @@ async fn run_plain_accept_loop(
                     });
 
                     let outcome: Option<(u64, u64)> = {
-                        let result = TcpProxy::handle_connection_with_cache(
+                        let target_for_log = target_addr.clone();
+                        let relay = TcpProxy::handle_connection_with_cache(
                             inbound,
                             client_addr,
                             target_addr,
@@ -1067,8 +1084,17 @@ async fn run_plain_accept_loop(
                             total_tx_c,
                             total_rx_c,
                             buffer_size,
-                        )
-                        .await;
+                        );
+                        let result = match backend.clone() {
+                            Some(b) => tokio::select! {
+                                r = relay => r,
+                                _ = b.wait_kill() => {
+                                    warn!("TCP conn {} dropped: backend {} marked unhealthy", client_addr, target_for_log);
+                                    Err("backend marked unhealthy".into())
+                                }
+                            },
+                            None => relay.await,
+                        };
                         match result {
                             Ok((tx, rx)) => Some((tx, rx)),
                             Err(e) => {
