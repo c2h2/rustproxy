@@ -1,67 +1,35 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::net::TcpStream;
-use tracing::debug;
 
+/// Stub kept for CLI/configuration compatibility.
+///
+/// An earlier version of this module attempted to pool outbound `TcpStream`s
+/// by destination so that subsequent client connections could reuse them.
+/// That design is fundamentally unsafe for a forwarding proxy: handing the
+/// same outbound socket to two unrelated clients interleaves their byte
+/// streams. The pooling code has been removed; `get_connection` always
+/// returns `None` and the configured cache size is now purely advisory.
 #[derive(Clone)]
 pub struct ConnectionCache {
-    cache: Arc<tokio::sync::Mutex<HashMap<String, Vec<TcpStream>>>>,
     max_size_bytes: usize,
-    current_size_bytes: Arc<tokio::sync::Mutex<usize>>,
 }
 
 impl ConnectionCache {
     pub fn new(max_size_bytes: usize) -> Self {
-        Self {
-            cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            max_size_bytes,
-            current_size_bytes: Arc::new(tokio::sync::Mutex::new(0)),
-        }
+        Self { max_size_bytes }
     }
 
-    pub async fn get_connection(&self, target: &str) -> Option<TcpStream> {
-        if self.max_size_bytes == 0 {
-            return None; // No caching when size is 0
-        }
-
-        let mut cache = self.cache.lock().await;
-        if let Some(connections) = cache.get_mut(target) {
-            if let Some(conn) = connections.pop() {
-                let mut current_size = self.current_size_bytes.lock().await;
-                *current_size = current_size.saturating_sub(8192); // Estimate 8KB per connection
-                debug!("Retrieved cached connection for {}", target);
-                return Some(conn);
-            }
-        }
+    /// Always returns `None` — kept so call sites compile unchanged.
+    /// Reusing outbound TCP sockets across clients would mix their streams,
+    /// so this proxy never pools.
+    pub async fn get_connection(&self, _target: &str) -> Option<TcpStream> {
         None
     }
 
-
-    #[allow(dead_code)]
-    pub async fn store_connection(&self, target: &str, connection: TcpStream) {
-        if self.max_size_bytes == 0 {
-            debug!("Connection caching disabled");
-            return; // No caching when size is 0
-        }
-
-        let mut current_size = self.current_size_bytes.lock().await;
-        if *current_size + 8192 > self.max_size_bytes {
-            debug!("Connection cache full ({} bytes), not storing connection", *current_size);
-            return; // Cache full
-        }
-
-        let mut cache = self.cache.lock().await;
-        let connections = cache.entry(target.to_string()).or_insert_with(Vec::new);
-        connections.push(connection);
-        *current_size += 8192;
-        debug!("Stored connection for {} (cache size: {} bytes)", target, *current_size);
-    }
-
+    /// Returns `(0, max_size_bytes)` — the proxy never stores anything,
+    /// but the CLI still reports the configured size for visibility.
     pub async fn get_cache_stats(&self) -> (usize, usize) {
-        let current_size = *self.current_size_bytes.lock().await;
-        (current_size, self.max_size_bytes)
+        (0, self.max_size_bytes)
     }
-
 }
 
 pub fn parse_cache_size(cache_size_str: &str) -> Result<usize, String> {
@@ -107,46 +75,16 @@ mod tests {
         assert!(parse_cache_size("128xyz").is_err());
     }
 
+    /// The cache is a deliberate stub: pooling outbound TCP sockets across
+    /// unrelated clients would mix their byte streams. Lock that contract
+    /// in so a future change can't accidentally restore pooling without
+    /// also revisiting this test.
     #[tokio::test]
-    async fn test_connection_cache_basic() {
-        use tokio::net::TcpListener;
-        
-        let cache = ConnectionCache::new(1024 * 1024); // 1MB cache
-        
-        // Create a test server to get a valid TcpStream
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        
-        // Start a simple echo server
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                let mut buf = [0; 1024];
-                if let Ok(_) = stream.try_read(&mut buf) {
-                    // Just close the connection
-                }
-            }
-        });
-        
-        let target = addr.to_string();
-        let connection = TcpStream::connect(&target).await.unwrap();
-        
-        // Test storing and retrieving a connection
-        cache.store_connection(&target, connection).await;
-        let retrieved = cache.get_connection(&target).await;
-        assert!(retrieved.is_some());
-    }
+    async fn get_connection_always_returns_none() {
+        let cache = ConnectionCache::new(1024 * 1024);
+        assert!(cache.get_connection("anything:1234").await.is_none());
 
-    #[tokio::test]
-    async fn test_cache_size_limit() {
-        let cache = ConnectionCache::new(0); // No cache
-        
-        // Even if we try to store, it should not be retrievable
-        cache.store_connection("test", TcpStream::connect("127.0.0.1:22").await.unwrap_or_else(|_| {
-            // If connection fails, create a dummy - this test is about cache behavior
-            panic!("Need a valid connection for testing")
-        })).await;
-        
-        let retrieved = cache.get_connection("test").await;
-        assert!(retrieved.is_none()); // Should be None because cache size is 0
+        let zero_cache = ConnectionCache::new(0);
+        assert!(zero_cache.get_connection("anything:1234").await.is_none());
     }
 }
