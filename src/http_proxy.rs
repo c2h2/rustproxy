@@ -1,3 +1,4 @@
+use hyper::client::HttpConnector;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
@@ -6,7 +7,14 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{error, info};
 use crate::connection_cache::ConnectionCache;
+use crate::dns::HyperResolver;
 use crate::stats::StatsCollector;
+
+fn build_client() -> Client<HttpConnector<HyperResolver>> {
+    let mut connector = HttpConnector::new_with_resolver(HyperResolver);
+    connector.enforce_http(false);
+    Client::builder().build(connector)
+}
 
 pub struct HttpProxy {
     bind_addr: String,
@@ -87,7 +95,7 @@ async fn proxy_handler_with_stats(
     stats: Option<Arc<StatsCollector>>,
     client_addr: SocketAddr,
 ) -> Result<Response<Body>, Infallible> {
-    let client = Client::new();
+    let client = build_client();
     
     // Extract target host from the request
     let target_host = if let Some(host) = req.headers().get("host") {
@@ -227,7 +235,7 @@ async fn proxy_handler_with_stats(
 
 #[allow(dead_code)]
 async fn proxy_handler(mut req: Request<Body>, _target_addr: String) -> Result<Response<Body>, Infallible> {
-    let client = Client::new();
+    let client = build_client();
     
     // Extract target host from the request
     let target_host = if let Some(host) = req.headers().get("host") {
@@ -286,7 +294,7 @@ async fn proxy_handler(mut req: Request<Body>, _target_addr: String) -> Result<R
 mod tests {
     use super::*;
     use crate::test_utils::MockTcpServer;
-    use hyper::{Client, Request, Uri};
+    use hyper::{Request, Uri};
     use std::convert::TryFrom;
     use tokio::time::{sleep, Duration};
 
@@ -321,7 +329,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        let client = Client::new();
+        let client = build_client();
         let uri = Uri::try_from(format!("http://127.0.0.1:{}/test", mock_addr.port())).unwrap();
         let req = Request::builder()
             .uri(uri)

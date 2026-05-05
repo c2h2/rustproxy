@@ -898,7 +898,7 @@ impl TcpProxy {
             }
             None => {
                 debug!("Creating new connection for {} -> {}", client_addr, target_addr);
-                match timeout(Duration::from_secs(10), TcpStream::connect(&target_addr)).await {
+                match timeout(Duration::from_secs(10), crate::dns::tcp_connect(&target_addr)).await {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => {
                         error!("Failed to connect to {}: {}", target_addr, e);
@@ -1143,7 +1143,7 @@ async fn socks5_connect(
     target_host: &str,
     target_port: u16,
 ) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = timeout(Duration::from_secs(10), TcpStream::connect(proxy_addr))
+    let mut stream = timeout(Duration::from_secs(10), crate::dns::tcp_connect(proxy_addr))
         .await
         .map_err(|_| format!("SOCKS5 connect timeout to {}", proxy_addr))?
         .map_err(|e| format!("SOCKS5 connect failed to {}: {}", proxy_addr, e))?;

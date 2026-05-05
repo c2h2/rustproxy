@@ -93,7 +93,7 @@ impl SsProxy {
         };
 
         // Connect to the real target
-        let target_stream = match TcpStream::connect(&target_str).await {
+        let target_stream = match crate::dns::tcp_connect(&target_str).await {
             Ok(s) => s,
             Err(e) => {
                 warn!("SS failed to connect to {}: {}", target_str, e);

@@ -314,7 +314,7 @@ impl Socks5Proxy {
             }
             None => {
                 debug!("Creating new connection to {}", target_addr);
-                match TcpStream::connect(&target_addr).await {
+                match crate::dns::tcp_connect(&target_addr).await {
                     Ok(stream) => stream,
                     Err(e) => {
                         warn!("Failed to connect to {}: {}", target_addr, e);

@@ -73,6 +73,11 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
 - `--healthcheck` - Enable HTTP ping healthcheck for TCP LB backends (60s interval)
 - `--traffic-log <path>` - CSV file for persistent traffic history (default: `./rustproxy_traffic.csv`)
 - `--manager-addr <addr:port>` - Manager address for stats reporting
+- `--dns <servers>` - Custom DNS resolvers (overrides system DNS for all outbound lookups). Comma-separated list of one or more upstreams. Each entry may be:
+  - `8.8.8.8` — UDP on port 53
+  - `8.8.8.8:53` — UDP on explicit port
+  - `udp://1.1.1.1` — UDP (explicit prefix)
+  - `https://cloudflare-dns.com/dns-query` — DNS-over-HTTPS (DoH; hostname required so the TLS cert validates — bare-IP DoH URLs are rejected)
 
 ### Examples
 
@@ -162,6 +167,36 @@ sslocal -b 127.0.0.1:1080 -s <server-ip>:11180 -k mypassword -m aes-256-gcm
 # Then use the local SOCKS5 proxy
 curl -x socks5h://127.0.0.1:1080 http://example.com
 ```
+
+### Custom DNS Examples
+
+Useful when the system resolver is failing (`failed to lookup address information`), when you want to bypass a captive resolver, or when you need DoH for privacy.
+
+**HTTP proxy with Google + Cloudflare UDP DNS (failover):**
+```bash
+rustproxy --listen 127.0.0.1:8080 --mode http --dns 8.8.8.8,1.1.1.1
+```
+
+**SOCKS5 proxy with DNS-over-HTTPS:**
+```bash
+rustproxy --listen 127.0.0.1:1080 --mode socks5 \
+  --dns https://cloudflare-dns.com/dns-query,https://dns.google/dns-query
+```
+
+**TCP LB with mixed UDP + DoH upstreams:**
+```bash
+rustproxy --listen 127.0.0.1:8080 \
+  --target backend1.example.com:443,backend2.example.com:443 \
+  --mode tcp --lb roundrobin \
+  --dns 1.1.1.1,https://dns.google/dns-query
+```
+
+**HTTP proxy using a non-standard UDP DNS port:**
+```bash
+rustproxy --listen 127.0.0.1:8080 --mode http --dns 9.9.9.9:53,udp://149.112.112.112
+```
+
+When `--dns` is set, the system resolver is **not** used — every hostname (TCP, SOCKS5, HTTP, Shadowsocks) is resolved through the configured upstreams in order.
 
 ## Architecture
 

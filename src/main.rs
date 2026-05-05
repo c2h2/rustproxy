@@ -8,6 +8,7 @@ mod http_proxy;
 mod socks5_proxy;
 mod ss_proxy;
 mod vmess;
+pub mod dns;
 mod connection_cache;
 pub mod stats;
 pub mod manager;
@@ -58,6 +59,14 @@ fn print_usage() {
     println!("  --buffer-size <size>          Server→client relay buffer (default: 16mb)");
     println!("                               Decouples fast server reads from slow client writes");
     println!("                               Examples: 256kb, 16mb, 64mb");
+    println!("  --dns <servers>              Custom DNS resolvers (overrides system DNS).");
+    println!("                               Comma-separated list. Each entry may be:");
+    println!("                                 8.8.8.8                       (UDP, port 53)");
+    println!("                                 8.8.8.8:53                    (UDP, explicit port)");
+    println!("                                 udp://1.1.1.1                 (UDP, explicit)");
+    println!("                                 https://cloudflare-dns.com/dns-query  (DoH)");
+    println!("                               Example: --dns 8.8.8.8,1.1.1.1");
+    println!("                               Example: --dns https://cloudflare-dns.com/dns-query,https://dns.google/dns-query");
     println!("  --healthcheck                Enable HTTP ping healthcheck for TCP LB backends");
     println!("                               Probes each backend via direct HTTP GET every 60s");
     println!("                               Disables failing backends; re-enables on recovery");
@@ -164,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ss_listen_port = None;
     let mut vmess_listen_port = None;
     let mut vmess_password = None;
+    let mut dns_spec: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -292,12 +302,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 healthcheck_enabled = true;
                 i += 1;
             }
+            "--dns" => {
+                if i + 1 < args.len() {
+                    dns_spec = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 print_usage();
                 std::process::exit(1);
             }
         }
+    }
+
+    if let Some(ref spec) = dns_spec {
+        if let Err(e) = dns::init_from_spec(spec) {
+            eprintln!("Error parsing --dns: {}", e);
+            std::process::exit(1);
+        }
+        info!("Custom DNS configured: {}", spec);
     }
 
     let listen = listen_addr.ok_or("Missing --listen parameter")?;
