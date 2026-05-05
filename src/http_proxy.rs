@@ -4,10 +4,9 @@ use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tracing::{error, info};
 use crate::connection_cache::ConnectionCache;
-use crate::dns::HyperResolver;
+use crate::dns::{self, HyperResolver};
 use crate::stats::StatsCollector;
 
 fn build_client() -> Client<HttpConnector<HyperResolver>> {
@@ -149,7 +148,7 @@ async fn proxy_handler_with_stats(
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
-                        match TcpStream::connect(&authority).await {
+                        match dns::tcp_connect(&authority).await {
                             Ok(mut server) => {
                                 let mut upgraded = upgraded;
                                 match tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
