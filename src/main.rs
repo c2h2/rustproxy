@@ -67,6 +67,7 @@ fn print_usage() {
     println!("                                 https://cloudflare-dns.com/dns-query  (DoH)");
     println!("                               Example: --dns 8.8.8.8,1.1.1.1");
     println!("                               Example: --dns https://cloudflare-dns.com/dns-query,https://dns.google/dns-query");
+    println!("  --dns-cache-size <N>         Max cached DNS entries (default: 16384, max: 262144)");
     println!("  --healthcheck                Enable HTTP ping healthcheck for TCP LB backends");
     println!("                               Probes each backend via direct HTTP GET every 60s");
     println!("                               Disables failing backends; re-enables on recovery");
@@ -174,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vmess_listen_port = None;
     let mut vmess_password = None;
     let mut dns_spec: Option<String> = None;
+    let mut dns_cache_size: usize = dns::DEFAULT_CACHE_SIZE;
 
     let mut i = 1;
     while i < args.len() {
@@ -310,6 +312,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--dns-cache-size" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<usize>() {
+                        Ok(n) => dns_cache_size = n,
+                        Err(_) => {
+                            eprintln!("Invalid --dns-cache-size: {}", args[i + 1]);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 print_usage();
@@ -319,11 +335,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref spec) = dns_spec {
-        if let Err(e) = dns::init_from_spec(spec) {
+        if let Err(e) = dns::init_from_spec(spec, dns_cache_size) {
             eprintln!("Error parsing --dns: {}", e);
             std::process::exit(1);
         }
-        info!("Custom DNS configured: {}", spec);
+        info!("Custom DNS configured: {} (cache: {} entries)", spec, dns_cache_size);
     }
 
     let listen = listen_addr.ok_or("Missing --listen parameter")?;

@@ -78,6 +78,7 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
   - `8.8.8.8:53` — UDP on explicit port
   - `udp://1.1.1.1` — UDP (explicit prefix)
   - `https://cloudflare-dns.com/dns-query` — DNS-over-HTTPS (DoH; hostname required so the TLS cert validates — bare-IP DoH URLs are rejected)
+- `--dns-cache-size <N>` - Max cached DNS entries when `--dns` is set (default: `16384`, hard cap: `262144`). Entries respect DNS TTL; only useful working-set size is bounded.
 
 ### Examples
 

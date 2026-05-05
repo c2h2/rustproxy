@@ -13,13 +13,16 @@ use once_cell::sync::OnceCell;
 
 static GLOBAL_RESOLVER: OnceCell<Arc<TokioAsyncResolver>> = OnceCell::new();
 
+pub const DEFAULT_CACHE_SIZE: usize = 16_384;
+pub const MAX_CACHE_SIZE: usize = 262_144;
+
 /// Initialize the global resolver from a comma-separated spec list.
 /// Each spec is one of:
 ///   - `1.1.1.1`             → UDP on port 53
 ///   - `1.1.1.1:53`          → UDP on given port
 ///   - `udp://1.1.1.1[:53]`  → UDP (explicit)
 ///   - `https://host/path`   → DNS-over-HTTPS
-pub fn init_from_spec(spec: &str) -> Result<(), String> {
+pub fn init_from_spec(spec: &str, cache_size: usize) -> Result<(), String> {
     let mut config = ResolverConfig::new();
     let mut count = 0;
 
@@ -33,8 +36,16 @@ pub fn init_from_spec(spec: &str) -> Result<(), String> {
         return Err("--dns requires at least one server".to_string());
     }
 
+    if cache_size > MAX_CACHE_SIZE {
+        return Err(format!(
+            "--dns-cache-size {} exceeds maximum {}",
+            cache_size, MAX_CACHE_SIZE
+        ));
+    }
+
     let mut opts = ResolverOpts::default();
     opts.use_hosts_file = false;
+    opts.cache_size = cache_size;
 
     let resolver = TokioAsyncResolver::tokio(config, opts);
     GLOBAL_RESOLVER
@@ -215,5 +226,51 @@ impl tower_service::Service<hyper::client::connect::dns::Name> for HyperResolver
             let iter = (host.as_str(), 0u16).to_socket_addrs()?;
             Ok(iter.collect::<Vec<_>>().into_iter())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn cache_size_clamped_at_max() {
+        // 0 cache size disables caching but is allowed; values over MAX_CACHE_SIZE rejected.
+        let err = init_from_spec("1.1.1.1", MAX_CACHE_SIZE + 1).unwrap_err();
+        assert!(err.contains("exceeds maximum"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    #[ignore = "network test"]
+    async fn cache_speeds_up_repeat_lookups() {
+        // Initialize with a small cache to verify hits occur.
+        let _ = init_from_spec("1.1.1.1,8.8.8.8", 1024);
+
+        let host = "example.com:443";
+
+        let t0 = Instant::now();
+        let _ = resolve(host).await.expect("first lookup");
+        let cold = t0.elapsed();
+
+        // Repeat 50 times — these should be served from cache.
+        let t1 = Instant::now();
+        for _ in 0..50 {
+            let _ = resolve(host).await.expect("warm lookup");
+        }
+        let warm_total = t1.elapsed();
+        let warm_avg = warm_total / 50;
+
+        eprintln!(
+            "cold={:?} warm_avg={:?} (50x total {:?})",
+            cold, warm_avg, warm_total
+        );
+        // Warm avg should be at least 10x faster than cold (network RTT vs in-memory map lookup).
+        assert!(
+            warm_avg * 10 < cold,
+            "expected warm_avg ({:?}) << cold ({:?})",
+            warm_avg,
+            cold
+        );
     }
 }
