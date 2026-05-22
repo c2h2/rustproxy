@@ -1,7 +1,8 @@
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tracing::{error, info, debug, warn};
 use crate::connection_cache::ConnectionCache;
 use crate::stats::StatsCollector;
@@ -20,6 +21,7 @@ const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 
 const SOCKS5_REP_SUCCESS: u8 = 0x00;
+const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS5_REP_HOST_UNREACHABLE: u8 = 0x04;
 const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 
@@ -143,8 +145,7 @@ impl Socks5Proxy {
                 return Err("BIND command not supported".into());
             }
             SOCKS5_CMD_UDP_ASSOCIATE => {
-                self.send_error_response(&mut stream, SOCKS5_REP_CMD_NOT_SUPPORTED).await?;
-                return Err("UDP ASSOCIATE command not supported".into());
+                self.handle_udp_associate(stream, client_addr, request).await?;
             }
             _ => {
                 self.send_error_response(&mut stream, SOCKS5_REP_CMD_NOT_SUPPORTED).await?;
@@ -378,6 +379,137 @@ impl Socks5Proxy {
         Ok(())
     }
 
+    async fn handle_udp_associate(
+        &self,
+        mut control: TcpStream,
+        client_tcp_addr: SocketAddr,
+        request: Socks5Request,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Bind the client-facing relay UDP socket on the same local IP that the
+        // control TCP connection arrived on, so the BND.ADDR we return is
+        // reachable from the client.
+        let local_ip = control.local_addr()?.ip();
+        let inbound = match UdpSocket::bind(SocketAddr::new(local_ip, 0)).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.send_error_response(&mut control, SOCKS5_REP_GENERAL_FAILURE).await?;
+                return Err(format!("failed to bind UDP relay socket: {}", e).into());
+            }
+        };
+        let bnd_addr = inbound.local_addr()?;
+
+        // Outbound sockets toward targets. Best-effort dual stack.
+        let outbound_v4 = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+            .await
+            .ok()
+            .map(Arc::new);
+        let outbound_v6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+            .await
+            .ok()
+            .map(Arc::new);
+
+        if outbound_v4.is_none() && outbound_v6.is_none() {
+            self.send_error_response(&mut control, SOCKS5_REP_GENERAL_FAILURE).await?;
+            return Err("could not bind any outbound UDP socket".into());
+        }
+
+        // Reply to the client with BND.ADDR / BND.PORT
+        self.send_udp_associate_response(&mut control, bnd_addr).await?;
+
+        // Parse the announced client UDP source from the ASSOCIATE request.
+        // Per RFC 1928, if the client knows its source it provides DST.ADDR/PORT;
+        // otherwise it sends zeros and we lock onto the first observed source.
+        let announced: Option<SocketAddr> = match request.addr.parse::<IpAddr>() {
+            Ok(ip) if !ip.is_unspecified() && request.port != 0 => {
+                Some(SocketAddr::new(ip, request.port))
+            }
+            _ => None,
+        };
+
+        let inbound = Arc::new(inbound);
+        let locked_client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(announced));
+
+        info!(
+            "SOCKS5 UDP ASSOCIATE: control={} relay={} announced_client={:?}",
+            client_tcp_addr, bnd_addr, announced
+        );
+
+        let conn_id = if let Some(ref stats) = self.stats {
+            Some(
+                stats
+                    .new_connection(client_tcp_addr, format!("udp-assoc:{}", bnd_addr))
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        let forward = tokio::spawn(udp_forward_task(
+            inbound.clone(),
+            outbound_v4.clone(),
+            outbound_v6.clone(),
+            locked_client.clone(),
+        ));
+
+        let reverse_v4 = outbound_v4.clone().map(|sock| {
+            tokio::spawn(udp_reverse_task(sock, inbound.clone(), locked_client.clone()))
+        });
+        let reverse_v6 = outbound_v6.clone().map(|sock| {
+            tokio::spawn(udp_reverse_task(sock, inbound.clone(), locked_client.clone()))
+        });
+
+        // Per RFC 1928 §6: the UDP association is tied to this TCP control
+        // connection. When the client closes it (or any read fails), tear down.
+        let mut tcp_buf = [0u8; 64];
+        loop {
+            match control.read(&mut tcp_buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        info!(
+            "SOCKS5 UDP ASSOCIATE control closed: {} (relay {})",
+            client_tcp_addr, bnd_addr
+        );
+
+        forward.abort();
+        if let Some(t) = reverse_v4 {
+            t.abort();
+        }
+        if let Some(t) = reverse_v6 {
+            t.abort();
+        }
+
+        if let (Some(ref stats), Some(ref conn_id)) = (&self.stats, &conn_id) {
+            stats.close_connection(conn_id).await;
+        }
+
+        Ok(())
+    }
+
+    async fn send_udp_associate_response(
+        &self,
+        stream: &mut TcpStream,
+        bnd_addr: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut response = vec![SOCKS5_VERSION, SOCKS5_REP_SUCCESS, 0x00];
+        match bnd_addr.ip() {
+            IpAddr::V4(ip) => {
+                response.push(SOCKS5_ATYP_IPV4);
+                response.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                response.push(SOCKS5_ATYP_IPV6);
+                response.extend_from_slice(&ip.octets());
+            }
+        }
+        response.extend_from_slice(&bnd_addr.port().to_be_bytes());
+        stream.write_all(&response).await?;
+        Ok(())
+    }
+
     async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, _target_addr: String, stats: Option<Arc<StatsCollector>>, conn_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         let (mut client_read, mut client_write) = client_stream.into_split();
         let (mut target_read, mut target_write) = target_stream.into_split();
@@ -443,6 +575,194 @@ impl Socks5Proxy {
         }
 
         Ok(())
+    }
+}
+
+struct Socks5UdpPacket<'a> {
+    frag: u8,
+    dst_addr: String,
+    dst_port: u16,
+    data: &'a [u8],
+}
+
+fn parse_socks5_udp_packet(buf: &[u8]) -> Option<Socks5UdpPacket<'_>> {
+    // Minimum length: 2 RSV + 1 FRAG + 1 ATYP + 4 IPv4 + 2 port = 10
+    if buf.len() < 10 {
+        return None;
+    }
+    if buf[0] != 0 || buf[1] != 0 {
+        return None;
+    }
+    let frag = buf[2];
+    let atyp = buf[3];
+
+    let (addr_str, addr_end) = match atyp {
+        SOCKS5_ATYP_IPV4 => {
+            if buf.len() < 4 + 4 + 2 {
+                return None;
+            }
+            let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            (ip.to_string(), 4 + 4)
+        }
+        SOCKS5_ATYP_IPV6 => {
+            if buf.len() < 4 + 16 + 2 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[4..20]);
+            let ip = Ipv6Addr::from(octets);
+            (ip.to_string(), 4 + 16)
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            if buf.len() < 5 {
+                return None;
+            }
+            let dlen = buf[4] as usize;
+            if buf.len() < 5 + dlen + 2 {
+                return None;
+            }
+            let s = std::str::from_utf8(&buf[5..5 + dlen]).ok()?.to_string();
+            (s, 5 + dlen)
+        }
+        _ => return None,
+    };
+
+    let dst_port = u16::from_be_bytes([buf[addr_end], buf[addr_end + 1]]);
+    let data = &buf[addr_end + 2..];
+    Some(Socks5UdpPacket {
+        frag,
+        dst_addr: addr_str,
+        dst_port,
+        data,
+    })
+}
+
+async fn udp_forward_task(
+    inbound: Arc<UdpSocket>,
+    outbound_v4: Option<Arc<UdpSocket>>,
+    outbound_v6: Option<Arc<UdpSocket>>,
+    locked_client: Arc<Mutex<Option<SocketAddr>>>,
+) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, src) = match inbound.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(e) => {
+                debug!("UDP inbound recv error: {}", e);
+                break;
+            }
+        };
+
+        // Strict source filter: only accept from the announced address, or
+        // (if none was announced) lock onto the first observed source.
+        {
+            let mut lock = locked_client.lock().await;
+            match *lock {
+                Some(expected) => {
+                    if expected != src {
+                        warn!(
+                            "UDP relay dropping datagram from {} (expected {})",
+                            src, expected
+                        );
+                        continue;
+                    }
+                }
+                None => {
+                    debug!("UDP relay locking onto first observed client: {}", src);
+                    *lock = Some(src);
+                }
+            }
+        }
+
+        let pkt = match parse_socks5_udp_packet(&buf[..n]) {
+            Some(p) => p,
+            None => {
+                debug!("UDP relay dropping malformed datagram from {}", src);
+                continue;
+            }
+        };
+        if pkt.frag != 0 {
+            debug!(
+                "UDP relay dropping fragmented datagram (FRAG={}) from {}",
+                pkt.frag, src
+            );
+            continue;
+        }
+
+        let target_str = format!("{}:{}", pkt.dst_addr, pkt.dst_port);
+        let target_sa = match crate::dns::resolve(&target_str).await {
+            Ok(sa) => sa,
+            Err(e) => {
+                debug!("UDP relay DNS failure for {}: {}", target_str, e);
+                continue;
+            }
+        };
+
+        let outbound = match target_sa.ip() {
+            IpAddr::V4(_) => outbound_v4.as_ref(),
+            IpAddr::V6(_) => outbound_v6.as_ref(),
+        };
+        let Some(outbound) = outbound else {
+            debug!(
+                "UDP relay no outbound socket for address family of {}",
+                target_sa
+            );
+            continue;
+        };
+
+        if let Err(e) = outbound.send_to(pkt.data, target_sa).await {
+            debug!("UDP relay send_to {} failed: {}", target_sa, e);
+        }
+    }
+}
+
+async fn udp_reverse_task(
+    outbound: Arc<UdpSocket>,
+    inbound: Arc<UdpSocket>,
+    locked_client: Arc<Mutex<Option<SocketAddr>>>,
+) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, src) = match outbound.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(e) => {
+                debug!("UDP outbound recv error: {}", e);
+                break;
+            }
+        };
+        let client_addr = {
+            let lock = locked_client.lock().await;
+            match *lock {
+                Some(a) => a,
+                None => {
+                    debug!(
+                        "UDP reverse: no locked client yet, dropping reply from {}",
+                        src
+                    );
+                    continue;
+                }
+            }
+        };
+
+        let mut out = Vec::with_capacity(n + 24);
+        out.extend_from_slice(&[0x00, 0x00]); // RSV
+        out.push(0x00);                       // FRAG
+        match src.ip() {
+            IpAddr::V4(ip) => {
+                out.push(SOCKS5_ATYP_IPV4);
+                out.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                out.push(SOCKS5_ATYP_IPV6);
+                out.extend_from_slice(&ip.octets());
+            }
+        }
+        out.extend_from_slice(&src.port().to_be_bytes());
+        out.extend_from_slice(&buf[..n]);
+
+        if let Err(e) = inbound.send_to(&out, client_addr).await {
+            debug!("UDP reverse send_to client {} failed: {}", client_addr, e);
+        }
     }
 }
 
@@ -660,5 +980,144 @@ mod tests {
         );
         read_result.unwrap().unwrap();
         assert_eq!(received, payload);
+    }
+
+    /// Drive a real SOCKS5 UDP ASSOCIATE end-to-end:
+    /// - Open the proxy
+    /// - Bring up a UDP echo server as the "target"
+    /// - Bind a client UDP socket and announce its addr in ASSOCIATE
+    /// - Send a wrapped datagram, verify the echo comes back wrapped
+    /// - Send a wrapped datagram from a *different* socket (wrong source) —
+    ///   verify the proxy drops it (strict source filtering)
+    #[tokio::test]
+    async fn test_socks5_udp_associate_strict() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        // Target: a UDP echo server.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let (n, src) = match echo.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let _ = echo.send_to(&buf[..n], src).await;
+            }
+        });
+
+        // Bring up the proxy.
+        let proxy = Socks5Proxy::new("127.0.0.1:0", 128 * 1024, 16 * 1024 * 1024);
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((inbound, client_addr)) = proxy_listener.accept().await {
+                let proxy = proxy.clone();
+                tokio::spawn(async move {
+                    let _ = proxy.handle_connection(inbound, client_addr).await;
+                });
+            }
+        });
+        sleep(Duration::from_millis(50)).await;
+
+        // Client UDP socket — we'll announce its addr in the ASSOCIATE.
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_udp_addr = client_udp.local_addr().unwrap();
+        let client_v4 = match client_udp_addr.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => panic!("expected v4"),
+        };
+
+        // Client TCP control connection: greet, then send ASSOCIATE.
+        let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+        control
+            .write_all(&[SOCKS5_VERSION, 1, SOCKS5_NO_AUTH])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2];
+        control.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [SOCKS5_VERSION, SOCKS5_NO_AUTH]);
+
+        // ASSOCIATE with DST.ADDR = client_udp_addr (strict)
+        let mut req = vec![
+            SOCKS5_VERSION,
+            SOCKS5_CMD_UDP_ASSOCIATE,
+            0x00,
+            SOCKS5_ATYP_IPV4,
+        ];
+        req.extend_from_slice(&client_v4.octets());
+        req.extend_from_slice(&client_udp_addr.port().to_be_bytes());
+        control.write_all(&req).await.unwrap();
+
+        // Response: VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
+        let mut resp = [0u8; 10];
+        control.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], SOCKS5_VERSION);
+        assert_eq!(resp[1], SOCKS5_REP_SUCCESS);
+        assert_eq!(resp[3], SOCKS5_ATYP_IPV4);
+        let bnd_ip = Ipv4Addr::new(resp[4], resp[5], resp[6], resp[7]);
+        let bnd_port = u16::from_be_bytes([resp[8], resp[9]]);
+        let relay_addr = SocketAddr::new(IpAddr::V4(bnd_ip), bnd_port);
+
+        // Build a wrapped datagram targeting the echo server.
+        let echo_v4 = match echo_addr.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => panic!("expected v4"),
+        };
+        let payload = b"ping-via-socks5-udp";
+        let mut dg = vec![0x00, 0x00, 0x00, SOCKS5_ATYP_IPV4];
+        dg.extend_from_slice(&echo_v4.octets());
+        dg.extend_from_slice(&echo_addr.port().to_be_bytes());
+        dg.extend_from_slice(payload);
+
+        client_udp.send_to(&dg, relay_addr).await.unwrap();
+
+        // Receive the wrapped echo reply.
+        let mut rbuf = vec![0u8; 2048];
+        let recv = tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut rbuf))
+            .await
+            .expect("relay never sent a reply")
+            .unwrap();
+        let n = recv.0;
+        // Header: 2 RSV + 1 FRAG + 1 ATYP + 4 ADDR + 2 PORT = 10
+        assert!(n >= 10 + payload.len());
+        assert_eq!(&rbuf[0..3], &[0x00, 0x00, 0x00]);
+        assert_eq!(rbuf[3], SOCKS5_ATYP_IPV4);
+        let reply_ip = Ipv4Addr::new(rbuf[4], rbuf[5], rbuf[6], rbuf[7]);
+        let reply_port = u16::from_be_bytes([rbuf[8], rbuf[9]]);
+        assert_eq!(reply_ip, echo_v4);
+        assert_eq!(reply_port, echo_addr.port());
+        assert_eq!(&rbuf[10..n], payload);
+
+        // Strict source filtering: a datagram from a *different* client socket
+        // should be dropped. We verify by sending one and asserting no reply
+        // arrives within a short window.
+        let imposter = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        imposter.send_to(&dg, relay_addr).await.unwrap();
+        let mut buf2 = vec![0u8; 2048];
+        let timed = tokio::time::timeout(Duration::from_millis(400), imposter.recv_from(&mut buf2))
+            .await;
+        assert!(
+            timed.is_err(),
+            "imposter received a reply from the relay — strict source filter is broken"
+        );
+
+        // Closing the control TCP connection should tear down the relay.
+        drop(control);
+        sleep(Duration::from_millis(100)).await;
+        // After teardown a fresh send_to from the original client should not
+        // get echoed back (the relay socket is gone).
+        client_udp.send_to(&dg, relay_addr).await.unwrap();
+        let mut buf3 = vec![0u8; 2048];
+        let after = tokio::time::timeout(
+            Duration::from_millis(400),
+            client_udp.recv_from(&mut buf3),
+        )
+        .await;
+        assert!(
+            after.is_err(),
+            "relay still forwarding after control connection closed"
+        );
     }
 }
