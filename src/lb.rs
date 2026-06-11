@@ -48,6 +48,8 @@ pub struct BackendStats {
     pub hc_status: AtomicU64,
     /// Last healthcheck epoch seconds (0=never)
     pub hc_last_check_epoch: AtomicU64,
+    /// Consecutive healthcheck failures (reset on success)
+    pub hc_consecutive_fails: AtomicU64,
 }
 
 impl BackendStats {
@@ -61,6 +63,7 @@ impl BackendStats {
             hc_response_ms: AtomicU64::new(0),
             hc_status: AtomicU64::new(0),
             hc_last_check_epoch: AtomicU64::new(0),
+            hc_consecutive_fails: AtomicU64::new(0),
         }
     }
 }
@@ -187,6 +190,7 @@ impl LoadBalancer {
             b.admin_disabled.store(false, Ordering::Relaxed);
             b.enabled.store(true, Ordering::Relaxed);
             b.stats.hc_status.store(0, Ordering::Relaxed); // reset to unknown
+            b.stats.hc_consecutive_fails.store(0, Ordering::Relaxed);
             true
         } else {
             false

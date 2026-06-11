@@ -68,10 +68,15 @@ fn print_usage() {
     println!("                               Example: --dns 8.8.8.8,1.1.1.1");
     println!("                               Example: --dns https://cloudflare-dns.com/dns-query,https://dns.google/dns-query");
     println!("  --dns-cache-size <N>         Max cached DNS entries (default: 16384, max: 262144)");
-    println!("  --healthcheck                Enable HTTP ping healthcheck for TCP LB backends");
-    println!("                               Probes each backend via direct HTTP GET every 60s");
-    println!("                               Disables failing backends; re-enables on recovery");
-    println!("                               Safety valve: re-enables all if every backend fails");
+    println!("  --healthcheck                Enable healthcheck for TCP LB backends (every 60s)");
+    println!("                               Disables a backend after 3 consecutive failures");
+    println!("                               (new connections only — in-flight streams drain)");
+    println!("                               Re-enables on recovery; safety valve re-enables all");
+    println!("                               if every backend fails");
+    println!("  --healthcheck-probe <kind>   Healthcheck probe protocol: 'tcp' (plain connect)");
+    println!("                               or 'socks5' (full SOCKS5 handshake + HTTP GET).");
+    println!("                               Default: socks5 when SS/VMess listeners are set,");
+    println!("                               tcp otherwise");
     println!();
     println!("Examples:");
     println!("  rustproxy --manager");
@@ -167,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lb_algorithm = None;
     let mut http_interface = None;
     let mut healthcheck_enabled = false;
+    let mut healthcheck_probe: Option<String> = None;
     let mut traffic_log_path = String::from("./rustproxy_traffic.csv");
     let mut buffer_size_str = None;
     let mut ss_password = None;
@@ -303,6 +309,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--healthcheck" => {
                 healthcheck_enabled = true;
                 i += 1;
+            }
+            "--healthcheck-probe" => {
+                if i + 1 < args.len() {
+                    healthcheck_probe = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             "--dns" => {
                 if i + 1 < args.len() {
@@ -594,10 +608,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
 
-                // Spawn SOCKS5 healthcheck if enabled
+                // Spawn healthcheck if enabled. Probe protocol must match what
+                // the backends actually speak: SS/VMess LB paths tunnel through
+                // the backends as SOCKS5 proxies, while plain TCP LB forwards
+                // raw bytes — so default to a SOCKS5 probe only when an SS or
+                // VMess listener is configured. `--healthcheck-probe` overrides
+                // (e.g. plain LB in front of a SOCKS5 farm).
                 if healthcheck_enabled {
-                    info!("HTTP ping healthcheck enabled for {} backends", lb.backends().len());
-                    healthcheck::spawn_healthcheck_task(lb.clone());
+                    let probe = match healthcheck_probe.as_deref() {
+                        Some("tcp") => healthcheck::ProbeKind::TcpConnect,
+                        Some("socks5") => healthcheck::ProbeKind::Socks5,
+                        Some(other) => {
+                            eprintln!(
+                                "Unknown --healthcheck-probe '{}'. Use 'tcp' or 'socks5'.",
+                                other
+                            );
+                            std::process::exit(1);
+                        }
+                        None => {
+                            if ss_cfg.is_some() || vmess_listen_port.is_some() {
+                                healthcheck::ProbeKind::Socks5
+                            } else {
+                                healthcheck::ProbeKind::TcpConnect
+                            }
+                        }
+                    };
+                    info!(
+                        "Healthcheck enabled for {} backends (probe={})",
+                        lb.backends().len(),
+                        probe.as_str()
+                    );
+                    healthcheck::spawn_healthcheck_task(lb.clone(), probe);
                 }
 
                 if let Err(e) = proxy.start().await {

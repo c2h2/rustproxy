@@ -928,25 +928,11 @@ impl TcpProxy {
 
         debug!("Proxying connection from {} to {}", client_addr, target_addr);
 
-        // Split inbound (generic) and outbound (TcpStream) and pump each
-        // direction independently. One user-space copy per direction.
+        // Pump each direction independently; a broken direction tears the
+        // other down after a bounded grace (see run_pumps).
         let _ = buffer_size;
-        let (ri, wi) = tokio::io::split(inbound);
-        let (ro, wo) = outbound.into_split();
-
-        let c2s = pump(ri, wo);
-        let s2c = pump(ro, wi);
-
-        let (r_c2s, r_s2c) = tokio::join!(c2s, s2c);
-
-        let (bytes_to_server, e_c2s) = match r_c2s {
-            Ok(n) => (n, None),
-            Err(pe) => (pe.bytes, Some(pe.source)),
-        };
-        let (bytes_to_client, e_s2c) = match r_s2c {
-            Ok(n) => (n, None),
-            Err(pe) => (pe.bytes, Some(pe.source)),
-        };
+        let (bytes_to_server, bytes_to_client, e_c2s, e_s2c) =
+            run_pumps(inbound, outbound).await;
 
         if let Some(e) = e_c2s {
             debug!(
@@ -1136,16 +1122,38 @@ async fn run_plain_accept_loop(
 
 /* -------------------- SOCKS5 client connect -------------------- */
 
+/// Upper bound on the whole SOCKS5 setup: TCP connect + auth + CONNECT
+/// reply. Without this, a backend that accepts and then goes silent hangs
+/// the client connection forever during setup.
+#[cfg(not(test))]
+const SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Connect to a SOCKS5 proxy and issue a CONNECT to `target_host:target_port`.
 /// Returns the tunnelled TcpStream ready for data relay.
+/// The entire handshake (not just the TCP connect) is bounded by
+/// SOCKS5_HANDSHAKE_TIMEOUT.
 async fn socks5_connect(
     proxy_addr: &str,
     target_host: &str,
     target_port: u16,
 ) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = timeout(Duration::from_secs(10), crate::dns::tcp_connect(proxy_addr))
+    timeout(
+        SOCKS5_HANDSHAKE_TIMEOUT,
+        socks5_connect_inner(proxy_addr, target_host, target_port),
+    )
+    .await
+    .map_err(|_| format!("SOCKS5 handshake timeout to {}", proxy_addr))?
+}
+
+async fn socks5_connect_inner(
+    proxy_addr: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stream = crate::dns::tcp_connect(proxy_addr)
         .await
-        .map_err(|_| format!("SOCKS5 connect timeout to {}", proxy_addr))?
         .map_err(|e| format!("SOCKS5 connect failed to {}: {}", proxy_addr, e))?;
 
     // Auth negotiation: version 5, 1 method, no-auth
@@ -1230,22 +1238,7 @@ where
     debug!("Proxying SS via SOCKS5: {} -> {}", client_addr, target_label);
 
     let _ = buffer_size;
-    let (ri, wi) = tokio::io::split(inbound);
-    let (ro, wo) = outbound.into_split();
-
-    let c2s = pump(ri, wo);
-    let s2c = pump(ro, wi);
-
-    let (r_c2s, r_s2c) = tokio::join!(c2s, s2c);
-
-    let (bytes_to_server, e_c2s) = match r_c2s {
-        Ok(n) => (n, None),
-        Err(pe) => (pe.bytes, Some(pe.source)),
-    };
-    let (bytes_to_client, e_s2c) = match r_s2c {
-        Ok(n) => (n, None),
-        Err(pe) => (pe.bytes, Some(pe.source)),
-    };
+    let (bytes_to_server, bytes_to_client, e_c2s, e_s2c) = run_pumps(inbound, outbound).await;
 
     if let Some(e) = e_c2s {
         debug!("Client->Server error after {} bytes for {}: {}", bytes_to_server, client_addr, e);
@@ -1264,52 +1257,109 @@ where
 
 /* -------------------------- Accurate pump -------------------------- */
 
-#[derive(Debug)]
-struct PumpErr {
-    bytes: u64,
-    source: io::Error,
-}
+/// How long the surviving direction may keep running after the other
+/// direction died with an I/O error (broken peer). A clean EOF half-close
+/// is NOT subject to this grace — it waits indefinitely, since protocols
+/// may legitimately stream long responses after the client closes its
+/// write side.
+#[cfg(not(test))]
+const HALF_CLOSE_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const HALF_CLOSE_GRACE: Duration = Duration::from_millis(500);
 
-impl std::fmt::Display for PumpErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (after {} bytes)", self.source, self.bytes)
-    }
-}
-impl std::error::Error for PumpErr {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-/// Copy from reader to writer with precise accounting.
-/// - Ok(total) on EOF (after half-closing writer).
-/// - Err(PumpErr { bytes: total_so_far, source }) on I/O error.
-async fn pump<R, W>(mut r: R, mut w: W) -> Result<u64, PumpErr>
+/// Copy from reader to writer with precise accounting into `total`.
+/// - Returns None on EOF (after half-closing the writer).
+/// - Returns Some(error) on I/O failure — after best-effort shutting down
+///   the writer so the opposite peer sees EOF instead of hanging forever.
+async fn pump<R, W>(mut r: R, mut w: W, total: &AtomicU64) -> Option<io::Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 256 * 1024];
-    let mut total: u64 = 0;
 
     loop {
         let n = match r.read(&mut buf).await {
-            Ok(0) => {
-                if let Err(e) = w.shutdown().await {
-                    return Err(PumpErr { bytes: total, source: e });
-                }
-                return Ok(total);
-            }
+            Ok(0) => return w.shutdown().await.err(),
             Ok(n) => n,
-            Err(e) => return Err(PumpErr { bytes: total, source: e }),
+            Err(e) => {
+                // Propagate the break: half-close the writer so the other
+                // peer observes EOF and the opposite pump can finish.
+                let _ = w.shutdown().await;
+                return Some(e);
+            }
         };
 
         if let Err(e) = w.write_all(&buf[..n]).await {
-            return Err(PumpErr { bytes: total, source: e });
+            return Some(e);
         }
 
-        total += n as u64;
+        total.fetch_add(n as u64, Ordering::Relaxed);
     }
+}
+
+/// Run both relay directions to completion.
+///
+/// A direction ending in clean EOF lets the other run indefinitely
+/// (legitimate half-close). A direction ending in an I/O error gives the
+/// other only HALF_CLOSE_GRACE to drain before the relay is torn down —
+/// this is what prevents half-broken connections (e.g. client RST with an
+/// idle server) from leaking the task and both sockets forever.
+///
+/// Returns (bytes client->server, bytes server->client, c2s error, s2c error).
+async fn run_pumps<S>(
+    inbound: S,
+    outbound: TcpStream,
+) -> (u64, u64, Option<io::Error>, Option<io::Error>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let tx = AtomicU64::new(0); // client -> server
+    let rx = AtomicU64::new(0); // server -> client
+
+    let (ri, wi) = tokio::io::split(inbound);
+    let (ro, wo) = outbound.into_split();
+
+    let c2s = pump(ri, wo, &tx);
+    let s2c = pump(ro, wi, &rx);
+    tokio::pin!(c2s, s2c);
+
+    fn grace_expired() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "relay torn down: opposite direction failed and drain grace expired",
+        )
+    }
+
+    let (e_c2s, e_s2c) = tokio::select! {
+        e1 = &mut c2s => {
+            let e2 = if e1.is_some() {
+                timeout(HALF_CLOSE_GRACE, &mut s2c)
+                    .await
+                    .unwrap_or_else(|_| Some(grace_expired()))
+            } else {
+                (&mut s2c).await
+            };
+            (e1, e2)
+        }
+        e2 = &mut s2c => {
+            let e1 = if e2.is_some() {
+                timeout(HALF_CLOSE_GRACE, &mut c2s)
+                    .await
+                    .unwrap_or_else(|_| Some(grace_expired()))
+            } else {
+                (&mut c2s).await
+            };
+            (e1, e2)
+        }
+    };
+
+    (
+        tx.load(Ordering::Relaxed),
+        rx.load(Ordering::Relaxed),
+        e_c2s,
+        e_s2c,
+    )
 }
 
 /* ------------------------------ Helpers ------------------------------ */
@@ -1491,5 +1541,141 @@ mod tests {
 
         assert_eq!(total_read, test_data.len());
         assert_eq!(&buffer[..total_read], test_data.as_slice());
+    }
+
+    /// Theory #3: if the client RSTs while the server stays idle, the relay
+    /// must still terminate. With `tokio::join!` over two independent pumps,
+    /// the failed client->server pump never tears down the server->client
+    /// pump, so the relay task (and both sockets) leak forever.
+    #[tokio::test]
+    async fn relay_terminates_when_client_rsts_and_server_stays_idle() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // Backend that accepts and then holds the socket open, never
+        // reading, writing, or closing (worst-case idle peer).
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = server.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+
+        // Front listener standing in for the proxy acceptor.
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+
+        let relay = tokio::spawn(async move {
+            let (inbound, client_addr) = front.accept().await.unwrap();
+            let _ = TcpProxy::connect_and_relay(
+                inbound,
+                client_addr,
+                server_addr.to_string(),
+                ConnectionCache::new(0),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                0,
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        // Let the relay establish its outbound leg before breaking the client.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // SO_LINGER=0 makes the close emit RST instead of FIN.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(StdDuration::from_secs(0)))
+            .unwrap();
+        drop(client);
+
+        let done = tokio::time::timeout(Duration::from_secs(5), relay).await;
+        assert!(
+            done.is_ok(),
+            "relay leaked: did not terminate within 5s after client RST with an idle server"
+        );
+    }
+
+    /// A clean half-close (FIN) is NOT an error: the server must still be
+    /// able to deliver its response after the client shuts down its write
+    /// side, even when the response arrives later. Locks in that the leak
+    /// fix only applies a teardown grace to *broken* directions.
+    #[tokio::test]
+    async fn clean_half_close_lets_late_server_data_through() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // Backend: read until EOF, wait (longer than any teardown grace),
+        // then send a response and close.
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = server.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = sock.write_all(b"late response").await;
+        });
+
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (inbound, client_addr) = front.accept().await.unwrap();
+            let _ = TcpProxy::connect_and_relay(
+                inbound,
+                client_addr,
+                server_addr.to_string(),
+                ConnectionCache::new(0),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                0,
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap(); // clean FIN, read side stays open
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+            .await
+            .expect("timed out waiting for late server response")
+            .unwrap();
+        assert_eq!(resp, b"late response");
+    }
+
+    /// Theory: `socks5_connect` only bounds the TCP connect, not the SOCKS5
+    /// handshake — a backend that accepts and then goes silent hangs the
+    /// client connection forever during setup.
+    #[tokio::test]
+    async fn socks5_connect_does_not_hang_on_unresponsive_backend() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // Accepts the connection and never responds.
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (sock, _) = server.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            socks5_connect(&server_addr, "example.com", 80),
+        )
+        .await;
+        match result {
+            Ok(inner) => assert!(inner.is_err(), "handshake against silent backend must fail"),
+            Err(_) => panic!("socks5_connect hung >5s on an unresponsive backend"),
+        }
     }
 }
