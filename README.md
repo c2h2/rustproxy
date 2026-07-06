@@ -376,6 +376,20 @@ Measured on Apple M4 (macOS), loopback, release build (2026-07):
 
 Reproduce: run a local backend (`node -e 'require("http").createServer((q,s)=>s.end("ok")).listen(9000)'`), start `rustproxy --listen 127.0.0.1:18080 --mode http`, then `hey -n 50000 -c 100 -x http://127.0.0.1:18080 http://127.0.0.1:9000/`. For TCP mode, point `--target` at a local `iperf3 -s` and run `iperf3 -c` against the proxy port.
 
+### vs Squid 6.13
+
+Same machine, same backend and load; Squid configured with caching and access logging disabled:
+
+| Metric | rustproxy | Squid 6.13 |
+|---|---|---|
+| Plain HTTP forward proxy (`hey -c 100`) | 4,572 req/s | **9,077 req/s** |
+| HTTPS CONNECT setup rate (`hey -c 100`) | 1,472 req/s | **2,363 req/s** |
+| CONNECT bulk throughput (200 MB, 3 alternating rounds) | 359–494 MB/s | 318–473 MB/s (tie — both bounded by the TLS test backend) |
+| Raw TCP relay | **86 Gbit/s** | n/a (no raw TCP mode) |
+| Memory (RSS, light load) | **~9 MB** | ~27 MB |
+
+Squid's higher request rate comes from its persistent backend connection pool — rustproxy currently dials the target fresh per plain-HTTP request. For long-lived CONNECT tunnels (typical HTTPS browsing) sustained throughput is equivalent, while rustproxy adds built-in DoT/DoH DNS, SOCKS5/Shadowsocks modes, TCP load balancing, and a ~3× smaller footprint in a single static binary.
+
 ### Dependencies
 
 - **tokio**: Async runtime
