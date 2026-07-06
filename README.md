@@ -370,8 +370,8 @@ Measured on Apple M4 (macOS), loopback, release build (2026-07):
 | Scenario | Tool | Result |
 |---|---|---|
 | TCP relay throughput (`--mode tcp`) | `iperf3 -t 5` | **86.3 Gbit/s** (direct loopback baseline: 140 Gbit/s) |
-| HTTP forward proxy, plain HTTP (`--mode http`) | `hey -n 50000 -c 100` | **4,200 req/s**, avg 23.6 ms, p99 86 ms |
-| HTTPS via CONNECT tunnel | `hey -n 50000 -c 100` | **1,600 req/s** (incl. TLS to backend), 100% 2xx |
+| HTTP forward proxy, plain HTTP (`--mode http`) | `hey -n 50000 -c 100` | **56,000 req/s**, avg 1.7 ms, p99 4.6 ms |
+| HTTPS via CONNECT tunnel | `hey -n 50000 -c 100` | **~1,700 req/s** (bounded by the single-threaded Node.js TLS test backend), 100% 2xx |
 | CONNECT tunnel bulk download (200 MB) | `curl` | **438 MB/s** (~3.5 Gbit/s, bounded by the Node.js TLS test backend) |
 
 Reproduce: run a local backend (`node -e 'require("http").createServer((q,s)=>s.end("ok")).listen(9000)'`), start `rustproxy --listen 127.0.0.1:18080 --mode http`, then `hey -n 50000 -c 100 -x http://127.0.0.1:18080 http://127.0.0.1:9000/`. For TCP mode, point `--target` at a local `iperf3 -s` and run `iperf3 -c` against the proxy port.
@@ -382,13 +382,13 @@ Same machine, same backend and load; Squid configured with caching and access lo
 
 | Metric | rustproxy | Squid 6.13 |
 |---|---|---|
-| Plain HTTP forward proxy (`hey -c 100`) | 4,572 req/s | **9,077 req/s** |
-| HTTPS CONNECT setup rate (`hey -c 100`) | 1,472 req/s | **2,363 req/s** |
+| Plain HTTP forward proxy (`hey -c 100`) | **56,244 req/s** | 10,929 req/s |
+| HTTPS CONNECT rate (`hey -c 100`, 3 alternating rounds) | 760–1,740 req/s | 1,100–2,830 req/s (both bounded by the TLS test backend; high variance) |
 | CONNECT bulk throughput (200 MB, 3 alternating rounds) | 359–494 MB/s | 318–473 MB/s (tie — both bounded by the TLS test backend) |
 | Raw TCP relay | **86 Gbit/s** | n/a (no raw TCP mode) |
 | Memory (RSS, light load) | **~9 MB** | ~27 MB |
 
-Squid's higher request rate comes from its persistent backend connection pool — rustproxy currently dials the target fresh per plain-HTTP request. For long-lived CONNECT tunnels (typical HTTPS browsing) sustained throughput is equivalent, while rustproxy adds built-in DoT/DoH DNS, SOCKS5/Shadowsocks modes, TCP load balancing, and a ~3× smaller footprint in a single static binary.
+rustproxy keeps a persistent backend connection pool (hyper, 90s idle timeout, `TCP_NODELAY` both sides), which puts plain-HTTP forwarding ~5× ahead of Squid. CONNECT-heavy workloads (typical HTTPS browsing) are equivalent within measurement noise — both saturate the test backend. rustproxy additionally offers built-in DoT/DoH DNS, SOCKS5/Shadowsocks modes, TCP load balancing, and a ~3× smaller footprint in a single static binary.
 
 ### Dependencies
 

@@ -4,7 +4,8 @@ use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tracing::{debug, error, info};
 use crate::connection_cache::ConnectionCache;
 use crate::dns::{self, HyperResolver};
 use crate::stats::StatsCollector;
@@ -12,7 +13,14 @@ use crate::stats::StatsCollector;
 fn build_client() -> Client<HttpConnector<HyperResolver>> {
     let mut connector = HttpConnector::new_with_resolver(HyperResolver);
     connector.enforce_http(false);
-    Client::builder().build(connector)
+    connector.set_nodelay(true);
+    // Keep idle backend connections around so repeat requests to the same
+    // host reuse the TCP connection instead of re-dialing (Squid-style
+    // persistent backend pool).
+    Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(128)
+        .build(connector)
 }
 
 pub struct HttpProxy {
@@ -61,22 +69,30 @@ impl HttpProxy {
             stats.clone().start_reporting().await;
         }
         
+        // One shared client: hyper's Client is cheap to clone and all clones
+        // share the same backend connection pool.
+        let client = build_client();
+
         let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
             let target = target.clone();
             let cache = cache.clone();
             let stats = stats.clone();
+            let client = client.clone();
             let client_addr = conn.remote_addr();
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
                     let target = target.clone();
                     let cache = cache.clone();
                     let stats = stats.clone();
-                    proxy_handler_with_stats(req, target, cache, stats, client_addr)
+                    let client = client.clone();
+                    proxy_handler_with_stats(req, target, cache, stats, client_addr, client)
                 }))
             }
         });
 
-        let server = Server::bind(&addr).serve(make_svc);
+        // NODELAY on accepted client sockets: without it, Nagle batches the
+        // small TLS records flowing through CONNECT tunnels and adds latency.
+        let server = Server::bind(&addr).tcp_nodelay(true).serve(make_svc);
 
         if let Err(e) = server.await {
             error!("HTTP server error: {}", e);
@@ -88,14 +104,13 @@ impl HttpProxy {
 
 
 async fn proxy_handler_with_stats(
-    mut req: Request<Body>, 
-    _target_addr: String, 
+    mut req: Request<Body>,
+    _target_addr: String,
     _cache: ConnectionCache,
     stats: Option<Arc<StatsCollector>>,
     client_addr: SocketAddr,
+    client: Client<HttpConnector<HyperResolver>>,
 ) -> Result<Response<Body>, Infallible> {
-    let client = build_client();
-    
     // Extract target host from the request
     let target_host = if let Some(host) = req.headers().get("host") {
         host.to_str().unwrap_or("").to_string()
@@ -150,6 +165,7 @@ async fn proxy_handler_with_stats(
                     Ok(upgraded) => {
                         match dns::tcp_connect(&authority).await {
                             Ok(mut server) => {
+                                let _ = server.set_nodelay(true);
                                 let mut upgraded = upgraded;
                                 match tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
                                     Ok((from_client, from_server)) => {
@@ -179,8 +195,8 @@ async fn proxy_handler_with_stats(
             // Handle regular HTTP requests by forwarding to target
             let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/");
             let target_uri = format!("http://{}{}", target_host, path);
-            
-            info!("Proxying HTTP request to: {}", target_uri);
+
+            debug!("Proxying HTTP request to: {}", target_uri);
 
             *req.uri_mut() = match target_uri.parse() {
                 Ok(uri) => uri,
@@ -192,6 +208,27 @@ async fn proxy_handler_with_stats(
                         .unwrap());
                 }
             };
+
+            // Strip hop-by-hop headers so a client's `Connection: close` (or
+            // `Proxy-Connection`) doesn't tear down pooled backend connections.
+            for h in ["proxy-connection", "connection", "keep-alive"] {
+                req.headers_mut().remove(h);
+            }
+
+            // Only buffer bodies when stats need byte counts; otherwise
+            // stream straight through.
+            if stats.is_none() {
+                return match client.request(req).await {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => {
+                        error!("Error proxying request: {}", e);
+                        Ok(Response::builder()
+                            .status(502)
+                            .body(Body::from("Proxy error"))
+                            .unwrap())
+                    }
+                };
+            }
 
             // Extract and measure request body
             let (parts, body) = req.into_parts();
@@ -206,7 +243,7 @@ async fn proxy_handler_with_stats(
                     let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
                     let response_size = body_bytes.len() as u64;
                     let resp = Response::from_parts(parts, Body::from(body_bytes));
-                    
+
                     // Update stats with actual bytes transferred
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
                         stats.update_connection(conn_id, request_size, response_size).await;
@@ -216,14 +253,14 @@ async fn proxy_handler_with_stats(
                 }
                 Err(e) => {
                     error!("Error proxying request: {}", e);
-                    
+
                     // Close connection in stats
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
                         stats.close_connection(conn_id).await;
                     }
-                    
+
                     Ok(Response::builder()
-                        .status(500)
+                        .status(502)
                         .body(Body::from("Proxy error"))
                         .unwrap())
                 }
