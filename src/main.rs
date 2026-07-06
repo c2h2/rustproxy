@@ -64,8 +64,11 @@ fn print_usage() {
     println!("                                 8.8.8.8                       (UDP, port 53)");
     println!("                                 8.8.8.8:53                    (UDP, explicit port)");
     println!("                                 udp://1.1.1.1                 (UDP, explicit)");
+    println!("                                 tcp://1.1.1.1                 (TCP, port 53)");
+    println!("                                 tls://1.1.1.1                 (DNS-over-TLS, port 853)");
     println!("                                 https://cloudflare-dns.com/dns-query  (DoH)");
-    println!("                               Example: --dns 8.8.8.8,1.1.1.1");
+    println!("                               Multiple servers = redundancy (retry falls through)");
+    println!("                               Example: --dns tls://1.1.1.1,tls://8.8.8.8");
     println!("                               Example: --dns https://cloudflare-dns.com/dns-query,https://dns.google/dns-query");
     println!("  --dns-cache-size <N>         Max cached DNS entries (default: 16384, max: 262144)");
     println!("  --healthcheck                Enable healthcheck for TCP LB backends (every 60s)");

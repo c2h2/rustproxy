@@ -21,7 +21,12 @@ pub const MAX_CACHE_SIZE: usize = 262_144;
 ///   - `1.1.1.1`             → UDP on port 53
 ///   - `1.1.1.1:53`          → UDP on given port
 ///   - `udp://1.1.1.1[:53]`  → UDP (explicit)
+///   - `tcp://1.1.1.1[:53]`  → TCP
+///   - `tls://1.1.1.1[:853]` → DNS-over-TLS
 ///   - `https://host/path`   → DNS-over-HTTPS
+///
+/// Multiple servers give redundancy: hickory retries the query against the
+/// next upstream when one times out or fails.
 pub fn init_from_spec(spec: &str, cache_size: usize) -> Result<(), String> {
     let mut config = ResolverConfig::new();
     let mut count = 0;
@@ -46,6 +51,11 @@ pub fn init_from_spec(spec: &str, cache_size: usize) -> Result<(), String> {
     let mut opts = ResolverOpts::default();
     opts.use_hosts_file = false;
     opts.cache_size = cache_size;
+    // Retry & redundancy: up to 3 attempts per server rotation, 3s per try.
+    // With multiple upstreams configured, failures/timeouts fall through to
+    // the next server before retrying.
+    opts.attempts = 3;
+    opts.timeout = std::time::Duration::from_secs(3);
 
     let resolver = TokioAsyncResolver::tokio(config, opts);
     GLOBAL_RESOLVER
@@ -78,15 +88,30 @@ fn parse_one(spec: &str) -> Result<NameServerConfig, String> {
         return Ok(ns);
     }
 
-    let stripped = spec.strip_prefix("udp://").unwrap_or(spec);
+    if let Some(rest) = spec.strip_prefix("tls://") {
+        // DoT: tls://ip[:853] or tls://hostname[:853]. The TLS name is used
+        // for SNI / cert validation — public resolvers like 1.1.1.1, 8.8.8.8
+        // and 9.9.9.9 carry IP SANs in their certs, so bare IPs work too.
+        let (host, port) = split_host_port(rest, 853);
+        let (ip, tls_name) = match host.parse::<IpAddr>() {
+            Ok(ip) => (ip, host.to_string()),
+            Err(_) => (resolve_via_system(host, port)?, host.to_string()),
+        };
+        let mut ns = NameServerConfig::new(SocketAddr::new(ip, port), Protocol::Tls);
+        ns.tls_dns_name = Some(tls_name);
+        ns.trust_negative_responses = true;
+        return Ok(ns);
+    }
+
+    let (stripped, protocol) = match spec.strip_prefix("tcp://") {
+        Some(rest) => (rest, Protocol::Tcp),
+        None => (spec.strip_prefix("udp://").unwrap_or(spec), Protocol::Udp),
+    };
     let (host, port) = split_host_port(stripped, 53);
     let ip: IpAddr = host
         .parse()
-        .map_err(|_| format!("DNS server must be an IP for UDP: {}", host))?;
-    Ok(NameServerConfig::new(
-        SocketAddr::new(ip, port),
-        Protocol::Udp,
-    ))
+        .map_err(|_| format!("DNS server must be an IP for {}: {}", protocol, host))?;
+    Ok(NameServerConfig::new(SocketAddr::new(ip, port), protocol))
 }
 
 fn split_host_port(s: &str, default_port: u16) -> (&str, u16) {
@@ -233,6 +258,32 @@ impl tower_service::Service<hyper::client::connect::dns::Name> for HyperResolver
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn parse_udp_tcp_tls_schemes() {
+        let ns = parse_one("udp://1.1.1.1").unwrap();
+        assert_eq!(ns.protocol, Protocol::Udp);
+        assert_eq!(ns.socket_addr, "1.1.1.1:53".parse().unwrap());
+
+        let ns = parse_one("tcp://1.1.1.1").unwrap();
+        assert_eq!(ns.protocol, Protocol::Tcp);
+        assert_eq!(ns.socket_addr, "1.1.1.1:53".parse().unwrap());
+
+        let ns = parse_one("tcp://8.8.8.8:5353").unwrap();
+        assert_eq!(ns.socket_addr, "8.8.8.8:5353".parse().unwrap());
+
+        let ns = parse_one("tls://1.1.1.1").unwrap();
+        assert_eq!(ns.protocol, Protocol::Tls);
+        assert_eq!(ns.socket_addr, "1.1.1.1:853".parse().unwrap());
+        assert_eq!(ns.tls_dns_name.as_deref(), Some("1.1.1.1"));
+
+        // Bare IP / default scheme still UDP
+        let ns = parse_one("9.9.9.9").unwrap();
+        assert_eq!(ns.protocol, Protocol::Udp);
+
+        // Hostname without tls/https scheme is rejected
+        assert!(parse_one("tcp://dns.google").is_err());
+    }
 
     #[tokio::test]
     async fn cache_size_clamped_at_max() {
