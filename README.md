@@ -77,7 +77,11 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
   - `8.8.8.8` — UDP on port 53
   - `8.8.8.8:53` — UDP on explicit port
   - `udp://1.1.1.1` — UDP (explicit prefix)
+  - `tcp://1.1.1.1` — DNS over TCP (port 53 default)
+  - `tls://1.1.1.1` — DNS-over-TLS (DoT, port 853 default; bare IPs work with public resolvers like `1.1.1.1`/`8.8.8.8`/`9.9.9.9` whose certs carry IP SANs; hostnames like `tls://dns.google` also accepted)
   - `https://cloudflare-dns.com/dns-query` — DNS-over-HTTPS (DoH; hostname required so the TLS cert validates — bare-IP DoH URLs are rejected)
+
+  Queries retry up to 3 times with a 3s per-try timeout; with multiple upstreams configured, a failing/timing-out server falls through to the next (redundancy).
 - `--dns-cache-size <N>` - Max cached DNS entries when `--dns` is set (default: `16384`, hard cap: `262144`). Entries respect DNS TTL; only useful working-set size is bounded.
 
 ### Examples
@@ -195,6 +199,16 @@ rustproxy --listen 127.0.0.1:8080 \
 **HTTP proxy using a non-standard UDP DNS port:**
 ```bash
 rustproxy --listen 127.0.0.1:8080 --mode http --dns 9.9.9.9:53,udp://149.112.112.112
+```
+
+**HTTP proxy with DNS-over-TLS (encrypted DNS, redundant upstreams):**
+```bash
+rustproxy --listen 127.0.0.1:8080 --mode http --dns tls://1.1.1.1,tls://8.8.8.8
+```
+
+**DNS over TCP (e.g. when UDP/53 is blocked):**
+```bash
+rustproxy --listen 127.0.0.1:8080 --mode http --dns tcp://1.1.1.1,tcp://8.8.8.8
 ```
 
 When `--dns` is set, the system resolver is **not** used — every hostname (TCP, SOCKS5, HTTP, Shadowsocks) is resolved through the configured upstreams in order.
@@ -348,6 +362,19 @@ cargo test
 ```bash
 cargo bench
 ```
+
+### Local Benchmark Results
+
+Measured on Apple M4 (macOS), loopback, release build (2026-07):
+
+| Scenario | Tool | Result |
+|---|---|---|
+| TCP relay throughput (`--mode tcp`) | `iperf3 -t 5` | **86.3 Gbit/s** (direct loopback baseline: 140 Gbit/s) |
+| HTTP forward proxy, plain HTTP (`--mode http`) | `hey -n 50000 -c 100` | **4,200 req/s**, avg 23.6 ms, p99 86 ms |
+| HTTPS via CONNECT tunnel | `hey -n 50000 -c 100` | **1,600 req/s** (incl. TLS to backend), 100% 2xx |
+| CONNECT tunnel bulk download (200 MB) | `curl` | **438 MB/s** (~3.5 Gbit/s, bounded by the Node.js TLS test backend) |
+
+Reproduce: run a local backend (`node -e 'require("http").createServer((q,s)=>s.end("ok")).listen(9000)'`), start `rustproxy --listen 127.0.0.1:18080 --mode http`, then `hey -n 50000 -c 100 -x http://127.0.0.1:18080 http://127.0.0.1:9000/`. For TCP mode, point `--target` at a local `iperf3 -s` and run `iperf3 -c` against the proxy port.
 
 ### Dependencies
 
