@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::io::AsyncWriteExt;
 use tracing::{info, debug, warn};
 
 use shadowsocks::config::{ServerConfig, ServerType};
@@ -120,43 +119,34 @@ impl SsProxy {
         stats: Option<Arc<StatsCollector>>,
         conn_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-        let (mut target_read, mut target_write) = target_stream.into_split();
+        // buffer_size is retained for CLI/config compatibility; the shared
+        // relay uses socket buffers for backpressure instead of a duplex pipe.
+        let _ = self.buffer_size;
 
-        // Client -> Target: direct copy
-        let client_to_target = tokio::io::copy(&mut client_read, &mut target_write);
-
-        // Target -> Client: buffered via duplex pipe
-        let buffer_size = self.buffer_size;
-        let (mut duplex_w, mut duplex_r) = tokio::io::duplex(buffer_size);
-        let t2buf = tokio::spawn(async move {
-            let result = tokio::io::copy(&mut target_read, &mut duplex_w).await;
-            let _ = duplex_w.shutdown().await;
-            result
-        });
-        let buf2c = tokio::io::copy(&mut duplex_r, &mut client_write);
-
-        let (result1, r_t2buf, r_buf2c) = tokio::join!(client_to_target, t2buf, buf2c);
-
-        let bytes_to_target = match &result1 {
-            Ok(bytes) => *bytes,
-            Err(e) => {
-                debug!("SS client->target error for {}: {}", client_addr, e);
-                0
-            }
-        };
-        if let Err(e) = &r_t2buf {
-            debug!("SS target->buffer task error for {}: {}", client_addr, e);
-        } else if let Ok(Err(e)) = &r_t2buf {
-            debug!("SS target->buffer copy error for {}: {}", client_addr, e);
+        // Match the plain-TCP relay's outbound tuning.
+        let _ = target_stream.set_nodelay(true);
+        #[cfg(any(unix, windows))]
+        {
+            let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
+            let _ = socket2::SockRef::from(&target_stream).set_tcp_keepalive(&ka);
         }
-        let bytes_to_client = match &r_buf2c {
-            Ok(bytes) => *bytes,
-            Err(e) => {
-                debug!("SS buffer->client error for {}: {}", client_addr, e);
-                0
-            }
-        };
+
+        // Independent per-direction pumps with a bounded teardown grace.
+        // The previous tokio::join! both (a) leaked the task and both sockets
+        // when a client vanished while the target stayed idle, and (b) never
+        // shut down the target's write side, so a client half-close (FIN) was
+        // never propagated and FIN-terminated request protocols would hang.
+        // run_pumps fixes both: it half-closes the peer on EOF and tears the
+        // relay down once a broken direction's drain grace expires.
+        let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) =
+            crate::tcp_proxy::run_pumps(client_stream, target_stream).await;
+
+        if let Some(e) = e_c2s {
+            debug!("SS client->target ended after {} bytes for {}: {}", bytes_to_target, client_addr, e);
+        }
+        if let Some(e) = e_s2c {
+            debug!("SS target->client ended after {} bytes for {}: {}", bytes_to_client, client_addr, e);
+        }
 
         info!(
             "SS connection {} closed. TX {} bytes, RX {} bytes",

@@ -511,57 +511,32 @@ impl Socks5Proxy {
     }
 
     async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, _target_addr: String, stats: Option<Arc<StatsCollector>>, conn_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut client_read, mut client_write) = client_stream.into_split();
-        let (mut target_read, mut target_write) = target_stream.into_split();
+        // buffer_size is retained for CLI/config compatibility; the shared
+        // relay relies on socket buffers for backpressure (matching the plain
+        // TCP path) rather than a duplex pipe.
+        let _ = self.buffer_size;
 
-        // Client→Target: copy then half-close target's write side so the
-        // upstream sees FIN and can release any pending response.
-        let client_to_target = async move {
-            let n = tokio::io::copy(&mut client_read, &mut target_write).await?;
-            let _ = target_write.shutdown().await;
-            Ok::<u64, std::io::Error>(n)
-        };
-
-        // Target→Client: buffered via duplex pipe so reads from target
-        // are decoupled from slow client writes. Shut down both the duplex
-        // writer (so buf2c sees EOF) and the client write half (so the
-        // client sees FIN) when each stage finishes.
-        let buffer_size = self.buffer_size;
-        let (mut duplex_w, mut duplex_r) = tokio::io::duplex(buffer_size);
-        let t2buf = tokio::spawn(async move {
-            let result = tokio::io::copy(&mut target_read, &mut duplex_w).await;
-            let _ = duplex_w.shutdown().await;
-            result
-        });
-        let buf2c = async move {
-            let n = tokio::io::copy(&mut duplex_r, &mut client_write).await?;
-            let _ = client_write.shutdown().await;
-            Ok::<u64, std::io::Error>(n)
-        };
-
-        // Use join to capture partial byte counts even on failures
-        let (result1, r_t2buf, r_buf2c) = tokio::join!(client_to_target, t2buf, buf2c);
-
-        // Extract byte counts from results, defaulting to 0 on error
-        let bytes_to_target = match &result1 {
-            Ok(bytes) => *bytes,
-            Err(e1) => {
-                debug!("Client-to-target copy error for {}: {}", client_addr, e1);
-                0
-            }
-        };
-        if let Err(e) = &r_t2buf {
-            debug!("Target->Buffer task error for {}: {}", client_addr, e);
-        } else if let Ok(Err(e)) = &r_t2buf {
-            debug!("Target->Buffer copy error for {}: {}", client_addr, e);
+        // Match the plain-TCP relay's outbound tuning.
+        let _ = target_stream.set_nodelay(true);
+        #[cfg(any(unix, windows))]
+        {
+            let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
+            let _ = socket2::SockRef::from(&target_stream).set_tcp_keepalive(&ka);
         }
-        let bytes_to_client = match &r_buf2c {
-            Ok(bytes) => *bytes,
-            Err(e2) => {
-                debug!("Buffer-to-client copy error for {}: {}", client_addr, e2);
-                0
-            }
-        };
+
+        // Independent per-direction pumps with a bounded teardown grace.
+        // The previous tokio::join! never cancelled the surviving direction,
+        // so an abrupt client close with an idle target leaked the task and
+        // both sockets forever. run_pumps propagates the break both ways.
+        let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) =
+            crate::tcp_proxy::run_pumps(client_stream, target_stream).await;
+
+        if let Some(e) = e_c2s {
+            debug!("SOCKS5 client->target ended after {} bytes for {}: {}", bytes_to_target, client_addr, e);
+        }
+        if let Some(e) = e_s2c {
+            debug!("SOCKS5 target->client ended after {} bytes for {}: {}", bytes_to_client, client_addr, e);
+        }
 
         info!(
             "SOCKS5 connection {} closed. Transferred {} bytes to target, {} bytes to client",
@@ -913,6 +888,65 @@ mod tests {
         let n = client.read(&mut buffer).await.unwrap();
 
         assert_eq!(&buffer[0..n], test_data);
+    }
+
+    /// Regression: a client RST while the target stays idle must tear the
+    /// relay down. The old `tokio::join!` relay never cancelled the surviving
+    /// direction, so the handler task and both sockets leaked forever. The
+    /// shared `run_pumps` teardown (with its bounded grace) fixes it — this
+    /// mirrors the TCP path's `relay_terminates_when_client_rsts_and_server_stays_idle`.
+    #[tokio::test]
+    async fn relay_terminates_on_client_rst_with_idle_target() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // Idle target: accept and hold the socket open, never reading/writing/closing.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = target.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+
+        let proxy = Socks5Proxy::new("127.0.0.1:0", 128 * 1024, 16 * 1024 * 1024);
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let handler = tokio::spawn(async move {
+            let (inbound, client_addr) = proxy_listener.accept().await.unwrap();
+            let _ = proxy.handle_connection(inbound, client_addr).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, SOCKS5_NO_AUTH]).await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+
+        let tip = match target_addr.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => panic!("expected v4"),
+        };
+        let mut req = vec![SOCKS5_VERSION, SOCKS5_CMD_CONNECT, 0x00, SOCKS5_ATYP_IPV4];
+        req.extend_from_slice(&tip.octets());
+        req.extend_from_slice(&target_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut resp = [0u8; 10];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[1], SOCKS5_REP_SUCCESS);
+
+        // Establish the relay, then RST the client (SO_LINGER=0 emits RST, not FIN).
+        client.write_all(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        socket2::SockRef::from(&client)
+            .set_linger(Some(std::time::Duration::from_secs(0)))
+            .unwrap();
+        drop(client);
+
+        // HALF_CLOSE_GRACE is 500ms under cfg(test); 5s leaves ample margin.
+        let done = tokio::time::timeout(Duration::from_secs(5), handler).await;
+        assert!(
+            done.is_ok(),
+            "SOCKS5 relay leaked: handler did not terminate after client RST with an idle target"
+        );
     }
 
     /// Regression test: when the upstream closes its side (sends FIN), the

@@ -247,9 +247,13 @@ impl tower_service::Service<hyper::client::connect::dns::Name> for HyperResolver
                 }
                 return Ok(addrs.into_iter());
             }
-            // System fallback (port 0 — hyper rewrites the port)
-            let iter = (host.as_str(), 0u16).to_socket_addrs()?;
-            Ok(iter.collect::<Vec<_>>().into_iter())
+            // System fallback (port 0 — hyper rewrites the port). Use tokio's
+            // async resolver, which offloads getaddrinfo to a blocking pool;
+            // calling std's blocking to_socket_addrs() here would stall the
+            // runtime worker for the whole DNS lookup.
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0u16)).await?.collect();
+            Ok(addrs.into_iter())
         })
     }
 }

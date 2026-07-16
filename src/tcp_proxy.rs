@@ -45,7 +45,7 @@ pub struct TcpProxy {
     total_rx_bytes: Arc<AtomicU64>, // server -> client
 
     // Recent connections: (time, client_ip)
-    recent_conns: Arc<tokio::sync::Mutex<Vec<(Instant, IpAddr)>>>,
+    recent_conns: Arc<std::sync::Mutex<Vec<(Instant, IpAddr)>>>,
 
     // For log context
     start_time: Instant,
@@ -84,7 +84,7 @@ impl TcpProxy {
             max_connections,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
-            recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
+            recent_conns: Arc::new(std::sync::Mutex::new(Vec::with_capacity(1024))),
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: None,
@@ -115,7 +115,7 @@ impl TcpProxy {
             max_connections,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
-            recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
+            recent_conns: Arc::new(std::sync::Mutex::new(Vec::with_capacity(1024))),
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: None,
@@ -146,7 +146,7 @@ impl TcpProxy {
             max_connections,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
-            recent_conns: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(1024))),
+            recent_conns: Arc::new(std::sync::Mutex::new(Vec::with_capacity(1024))),
             start_time: Instant::now(),
             listen_port: Arc::new(AtomicUsize::new(0)),
             lb: Some(lb),
@@ -300,12 +300,8 @@ impl TcpProxy {
                             }
 
                             {
-                                let recent = recent_conns.clone();
-                                let ip = client_addr.ip();
-                                tokio::spawn(async move {
-                                    let mut v = recent.lock().await;
-                                    v.push((Instant::now(), ip));
-                                });
+                                let mut v = recent_conns.lock().unwrap();
+                                v.push((Instant::now(), client_addr.ip()));
                             }
 
                             let cache = cache.clone();
@@ -470,12 +466,8 @@ impl TcpProxy {
                             }
 
                             {
-                                let recent = recent_conns.clone();
-                                let ip = client_addr.ip();
-                                tokio::spawn(async move {
-                                    let mut v = recent.lock().await;
-                                    v.push((Instant::now(), ip));
-                                });
+                                let mut v = recent_conns.lock().unwrap();
+                                v.push((Instant::now(), client_addr.ip()));
                             }
 
                             let active_connections = active_connections.clone();
@@ -622,12 +614,8 @@ impl TcpProxy {
                         }
 
                         {
-                            let recent = self.recent_conns.clone();
-                            let ip = client_addr.ip();
-                            tokio::spawn(async move {
-                                let mut v = recent.lock().await;
-                                v.push((Instant::now(), ip));
-                            });
+                            let mut v = self.recent_conns.lock().unwrap();
+                            v.push((Instant::now(), client_addr.ip()));
                         }
 
                         let (target_addr, backend) = if let Some(ref lb) = self.lb {
@@ -806,7 +794,7 @@ impl TcpProxy {
                 let mut ip_counts: HashMap<IpAddr, usize> = HashMap::new();
                 let now = Instant::now();
                 {
-                    let mut v = recent.lock().await;
+                    let mut v = recent.lock().unwrap();
                     v.retain(|(t, _)| now.duration_since(*t) <= RECENT_WINDOW);
                     for (_t, ip) in v.iter() {
                         *ip_counts.entry(*ip).or_insert(0) += 1;
@@ -997,7 +985,7 @@ async fn run_plain_accept_loop(
     max_connections: usize,
     default_target_addr: String,
     lb: Option<Arc<LoadBalancer>>,
-    recent_conns: Arc<tokio::sync::Mutex<Vec<(Instant, IpAddr)>>>,
+    recent_conns: Arc<std::sync::Mutex<Vec<(Instant, IpAddr)>>>,
     total_tx_bytes: Arc<AtomicU64>,
     total_rx_bytes: Arc<AtomicU64>,
     buffer_size: usize,
@@ -1017,12 +1005,8 @@ async fn run_plain_accept_loop(
                 }
 
                 {
-                    let recent = recent_conns.clone();
-                    let ip = client_addr.ip();
-                    tokio::spawn(async move {
-                        let mut v = recent.lock().await;
-                        v.push((Instant::now(), ip));
-                    });
+                    let mut v = recent_conns.lock().unwrap();
+                    v.push((Instant::now(), client_addr.ip()));
                 }
 
                 let (target_addr, backend) = if let Some(ref lb) = lb {
@@ -1307,7 +1291,11 @@ where
 /// idle server) from leaking the task and both sockets forever.
 ///
 /// Returns (bytes client->server, bytes server->client, c2s error, s2c error).
-async fn run_pumps<S>(
+///
+/// Shared by every relay path (plain TCP, SS/VMess LB, standalone SS, SOCKS5)
+/// so they all get the same leak-free teardown: an abrupt close on one side
+/// can never leave the other direction (and both sockets) hanging forever.
+pub(crate) async fn run_pumps<S>(
     inbound: S,
     outbound: TcpStream,
 ) -> (u64, u64, Option<io::Error>, Option<io::Error>)
