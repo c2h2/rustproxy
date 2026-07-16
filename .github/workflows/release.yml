@@ -31,6 +31,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags so build.rs `git describe --tags` reports the
+          # release tag (e.g. v1.9) instead of a bare commit hash.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

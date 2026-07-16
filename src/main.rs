@@ -125,8 +125,31 @@ fn normalize_bind_addr(addr: &str) -> String {
     }
 }
 
+/// Version string for `--version`: the crate version, augmented with the git
+/// describe and build date when the build embedded them.
+fn build_version() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    let git = env!("RUSTPROXY_GIT");
+    let date = env!("RUSTPROXY_BUILD_DATE");
+    match (git.is_empty(), date.is_empty()) {
+        (false, false) => format!("{} ({}, built {})", v, git, date),
+        (false, true) => format!("{} ({})", v, git),
+        (true, false) => format!("{} (built {})", v, date),
+        (true, true) => v.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+
+    // Answer --version/-V before any logging or fd-limit work so the output
+    // is a single clean line on stdout (no INFO lines, exit 0).
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("rustproxy {}", build_version());
+        return Ok(());
+    }
+
     tracing_subscriber::fmt::init();
 
     // Raise fd soft limit to hard limit and compute max connections
@@ -142,7 +165,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_conns
     };
 
-    let args: Vec<String> = env::args().collect();
     let cmdline_args = args.iter().skip(1).map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
 
     if args.len() < 2 {
