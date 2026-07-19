@@ -78,6 +78,9 @@ impl SsProxy {
         mut stream: shadowsocks::relay::tcprelay::proxy_stream::server::ProxyServerStream<TcpStream>,
         peer_addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Keep the client TCP leg warm before/during the long-lived tunnel.
+        crate::tcp_proxy::tune_tcp_stream(stream.get_ref());
+
         // Handshake: decrypt first payload, extract target address
         let target_addr = stream.handshake().await?;
         let target_str = target_addr.to_string();
@@ -123,13 +126,9 @@ impl SsProxy {
         // relay uses socket buffers for backpressure instead of a duplex pipe.
         let _ = self.buffer_size;
 
-        // Match the plain-TCP relay's outbound tuning.
-        let _ = target_stream.set_nodelay(true);
-        #[cfg(any(unix, windows))]
-        {
-            let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
-            let _ = socket2::SockRef::from(&target_stream).set_tcp_keepalive(&ka);
-        }
+        // Keep the target leg warm through NATs and detect dead peers.
+        // (Client side is an SS-encrypted stream, not a plain TcpStream.)
+        crate::tcp_proxy::tune_tcp_stream(&target_stream);
 
         // Independent per-direction pumps with a bounded teardown grace.
         // The previous tokio::join! both (a) leaked the task and both sockets

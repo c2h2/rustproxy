@@ -165,7 +165,9 @@ async fn proxy_handler_with_stats(
                     Ok(upgraded) => {
                         match dns::tcp_connect(&authority).await {
                             Ok(mut server) => {
-                                let _ = server.set_nodelay(true);
+                                // Idle HTTPS tunnels (long-lived TLS sessions)
+                                // die on NAT/firewall timeout without keepalive.
+                                crate::tcp_proxy::tune_tcp_stream(&server);
                                 let mut upgraded = upgraded;
                                 match tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
                                     Ok((from_client, from_server)) => {

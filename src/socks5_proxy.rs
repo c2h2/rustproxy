@@ -516,13 +516,11 @@ impl Socks5Proxy {
         // TCP path) rather than a duplex pipe.
         let _ = self.buffer_size;
 
-        // Match the plain-TCP relay's outbound tuning.
-        let _ = target_stream.set_nodelay(true);
-        #[cfg(any(unix, windows))]
-        {
-            let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
-            let _ = socket2::SockRef::from(&target_stream).set_tcp_keepalive(&ka);
-        }
+        // Keep both legs of the tunnel warm through NATs and detect dead peers.
+        // Previously only the target was tuned, so idle client-side NAT mappings
+        // silently expired and the next write looked like a random disconnect.
+        crate::tcp_proxy::tune_tcp_stream(&client_stream);
+        crate::tcp_proxy::tune_tcp_stream(&target_stream);
 
         // Independent per-direction pumps with a bounded teardown grace.
         // The previous tokio::join! never cancelled the surviving direction,

@@ -30,6 +30,46 @@ use socket2::{Domain, Protocol, Socket, Type};
 const REPORT_INTERVAL_SECS: u64 = 30; // periodic reporter interval
 const RECENT_WINDOW: StdDuration = StdDuration::from_secs(5 * 60); // 5 minutes
 
+/// How long a connection may sit completely idle before the first TCP
+/// keepalive probe. Must be shorter than typical NAT/firewall idle timeouts
+/// (often 30–120s); 20s keeps the mapping warm without excess probes.
+const TCP_KEEPALIVE_TIME: StdDuration = StdDuration::from_secs(20);
+/// Interval between successive keepalive probes after the first.
+const TCP_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(10);
+/// Give up after this many unanswered probes (~50s total dead-peer detect:
+/// 20 + 10*3).
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+/// Linux-only: max time unacknowledged data may sit on the wire before the
+/// connection is aborted. Covers blackhole paths where keepalive alone is
+/// slow to notice. Slightly above keepidle+keepintvl*keepcnt.
+#[cfg(target_os = "linux")]
+const TCP_USER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+
+/// Apply connection-stability socket options used by every relay path.
+///
+/// - `TCP_NODELAY` — avoid Nagle batching latency on interactive tunnels
+/// - Aggressive TCP keepalive — refresh NAT mappings and detect dead peers
+/// - `TCP_USER_TIMEOUT` (Linux) — abort stalled sends instead of hanging
+///
+/// Failures are ignored: some sandboxes/containers disallow these options.
+pub(crate) fn tune_tcp_stream(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+
+    #[cfg(any(unix, windows))]
+    {
+        let ka = TcpKeepalive::new()
+            .with_time(TCP_KEEPALIVE_TIME)
+            .with_interval(TCP_KEEPALIVE_INTERVAL)
+            .with_retries(TCP_KEEPALIVE_RETRIES);
+        let _ = SockRef::from(stream).set_tcp_keepalive(&ka);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = SockRef::from(stream).set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
+    }
+}
+
 /* ------------------------------ TcpProxy ------------------------------ */
 
 pub struct TcpProxy {
@@ -319,6 +359,8 @@ impl TcpProxy {
                                 let mut backend_ref: Option<Arc<crate::lb::Backend>> = None;
                                 let outcome: Option<(u64, u64)> = {
                                     let mut stream = stream;
+                                    // Keep the client TCP leg of the SS tunnel alive.
+                                    tune_tcp_stream(stream.get_ref());
                                     let result = match stream.handshake().await {
                                         Ok(ss_target_addr) => {
                                             let target_addr = ss_target_addr.to_string();
@@ -480,6 +522,8 @@ impl TcpProxy {
                             active_connections.fetch_add(1, Ordering::Relaxed);
 
                             tokio::spawn(async move {
+                                // Keep the client TCP leg of the VMess tunnel alive.
+                                tune_tcp_stream(&stream);
                                 let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| t.next_conn_id());
                                 let mut backend_ref: Option<Arc<crate::lb::Backend>> = None;
                                 let outcome: Option<(u64, u64)> = {
@@ -649,6 +693,8 @@ impl TcpProxy {
                             let conn_id = tracker.as_ref().map(|t: &Arc<ConnectionTracker>| t.next_conn_id());
                             let outcome: Option<(u64, u64)> = {
                                 let mut stream = stream;
+                                // Keep the client TCP leg of the SS tunnel alive.
+                                tune_tcp_stream(stream.get_ref());
                                 let result = match stream.handshake().await {
                                     Ok(ss_target_addr) => {
                                         let ss_target = ss_target_addr.to_string();
@@ -842,13 +888,9 @@ impl TcpProxy {
         total_rx_bytes: Arc<AtomicU64>,
         buffer_size: usize,
     ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
-        // TCP-specific inbound tuning
-        let _ = inbound.set_nodelay(true);
-        #[cfg(any(unix, windows))]
-        {
-            let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
-            let _ = SockRef::from(&inbound).set_tcp_keepalive(&ka);
-        }
+        // Keep both ends of the tunnel warm through NATs/firewalls and
+        // detect dead peers promptly (see tune_tcp_stream).
+        tune_tcp_stream(&inbound);
 
         Self::connect_and_relay(
             inbound, client_addr, target_addr, cache, stats,
@@ -906,13 +948,9 @@ impl TcpProxy {
             }
         };
 
-        // Outbound TCP tuning
-        let _ = outbound.set_nodelay(true);
-        #[cfg(any(unix, windows))]
-        {
-            let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
-            let _ = SockRef::from(&outbound).set_tcp_keepalive(&ka);
-        }
+        // Outbound TCP tuning (inbound already tuned by callers that own a
+        // TcpStream; SS/VMess encrypted inbounds are not plain sockets).
+        tune_tcp_stream(&outbound);
 
         debug!("Proxying connection from {} to {}", client_addr, target_addr);
 
@@ -1182,6 +1220,8 @@ async fn socks5_connect_inner(
         other => return Err(format!("SOCKS5 unknown atyp: {:02x}", other).into()),
     }
 
+    // Handshake succeeded — apply stability tuning for the long-lived tunnel.
+    tune_tcp_stream(&stream);
     Ok(stream)
 }
 
@@ -1212,12 +1252,7 @@ async fn relay_streams<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let _ = outbound.set_nodelay(true);
-    #[cfg(any(unix, windows))]
-    {
-        let ka = TcpKeepalive::new().with_time(StdDuration::from_secs(60));
-        let _ = SockRef::from(&outbound).set_tcp_keepalive(&ka);
-    }
+    tune_tcp_stream(&outbound);
 
     debug!("Proxying SS via SOCKS5: {} -> {}", client_addr, target_label);
 
@@ -1255,6 +1290,11 @@ const HALF_CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// - Returns None on EOF (after half-closing the writer).
 /// - Returns Some(error) on I/O failure — after best-effort shutting down
 ///   the writer so the opposite peer sees EOF instead of hanging forever.
+///
+/// A failed `shutdown` after clean EOF is *not* treated as an error: peers
+/// that already closed can return ENOTCONN/BrokenPipe, and misclassifying
+/// that would trigger HALF_CLOSE_GRACE instead of waiting indefinitely for
+/// the surviving direction (e.g. a long download after client FIN).
 async fn pump<R, W>(mut r: R, mut w: W, total: &AtomicU64) -> Option<io::Error>
 where
     R: AsyncRead + Unpin,
@@ -1264,7 +1304,10 @@ where
 
     loop {
         let n = match r.read(&mut buf).await {
-            Ok(0) => return w.shutdown().await.err(),
+            Ok(0) => {
+                let _ = w.shutdown().await;
+                return None;
+            }
             Ok(n) => n,
             Err(e) => {
                 // Propagate the break: half-close the writer so the other
@@ -1275,6 +1318,9 @@ where
         };
 
         if let Err(e) = w.write_all(&buf[..n]).await {
+            // Best-effort half-close the other way isn't possible here (we
+            // only hold one write half); the opposite pump is torn down via
+            // HALF_CLOSE_GRACE in run_pumps.
             return Some(e);
         }
 
