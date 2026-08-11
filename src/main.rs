@@ -19,6 +19,7 @@ mod traffic_log;
 mod conn_tracker;
 mod update;
 mod tcp_tune;
+mod rate_limit;
 mod bench;
 
 #[cfg(test)]
@@ -79,6 +80,10 @@ fn print_usage() {
     println!("                               on busy reads, halve when idle. Total across");
     println!("                               all conns is hard-capped at 1GiB.");
     println!("                               Examples: 64kb, 256kb, 1mb");
+    println!("  --limit-per-ip-mb <mb>       Per-client-IP speed limit in MB/s, fractions ok");
+    println!("                               (e.g. 0.1, 1, 1000). All connections from one");
+    println!("                               IP share the limit, up+down combined.");
+    println!("                               Default: unlimited.");
     println!("  --dns <servers>              Custom DNS resolvers (overrides system DNS).");
     println!("                               Comma-separated list. Each entry may be:");
     println!("                                 8.8.8.8                       (UDP, port 53)");
@@ -257,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut healthcheck_probe: Option<String> = None;
     let mut traffic_log_path = String::from("./rustproxy_traffic.csv");
     let mut buffer_size_str = None;
+    let mut limit_per_ip_mb: Option<f64> = None;
     let mut ss_password = None;
     let mut ss_method = None;
     let mut ss_listen_port = None;
@@ -349,6 +355,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--buffer-size" => {
                 if i + 1 < args.len() {
                     buffer_size_str = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--limit-per-ip-mb" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<f64>() {
+                        Ok(mb) if mb > 0.0 => limit_per_ip_mb = Some(mb),
+                        _ => {
+                            eprintln!("Invalid --limit-per-ip-mb: expected a positive number (e.g. 0.1, 1, 1000)");
+                            std::process::exit(1);
+                        }
+                    }
                     i += 2;
                 } else {
                     i += 1;
@@ -565,6 +585,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         info!("Custom DNS configured: {} (cache: {} entries)", spec, dns_cache_size);
+    }
+
+    if let Some(mb) = limit_per_ip_mb {
+        rate_limit::set_limit_per_ip(mb * rate_limit::BYTES_PER_MB);
+        info!("Per-IP speed limit: {} MB/s (shared across each IP's connections)", mb);
     }
 
     let listen = listen_addr.ok_or("Missing --listen parameter")?;

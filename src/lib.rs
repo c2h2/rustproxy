@@ -14,6 +14,7 @@ pub mod traffic_log;
 pub mod conn_tracker;
 pub mod update;
 pub mod tcp_tune;
+pub mod rate_limit;
 pub mod bench;
 
 #[cfg(test)]

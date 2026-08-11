@@ -522,7 +522,7 @@ impl Socks5Proxy {
         // so an abrupt client close with an idle target leaked the task and
         // both sockets forever. run_pumps propagates the break both ways.
         let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) =
-            crate::tcp_proxy::run_pumps(client_stream, target_stream, self.buffer_size).await;
+            crate::tcp_proxy::run_pumps(client_stream, target_stream, self.buffer_size, Some(client_addr.ip())).await;
 
         if let Some(e) = e_c2s {
             debug!("SOCKS5 client->target ended after {} bytes for {}: {}", bytes_to_target, client_addr, e);

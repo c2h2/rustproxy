@@ -183,7 +183,7 @@ async fn proxy_handler_with_stats(
                                 // we cannot apply OS keepalive to it; hyper server
                                 // already set nodelay on the accept socket.
                                 let (from_client, from_server, e_c2s, e_s2c) =
-                                    crate::tcp_proxy::run_pumps(upgraded, server, 0).await;
+                                    crate::tcp_proxy::run_pumps(upgraded, server, 0, Some(client_addr.ip())).await;
                                 if let Some(e) = e_c2s {
                                     debug!("CONNECT client->server {}: {}", authority, e);
                                 }

@@ -1023,7 +1023,7 @@ impl TcpProxy {
         // other down after a bounded grace (see run_pumps).
         let pump_buf = crate::tcp_tune::clamp_pump_buffer(buffer_size);
         let (bytes_to_server, bytes_to_client, e_c2s, e_s2c) =
-            run_pumps(inbound, outbound, pump_buf).await;
+            run_pumps(inbound, outbound, pump_buf, Some(client_addr.ip())).await;
 
         if let Some(e) = e_c2s {
             debug!(
@@ -1320,7 +1320,7 @@ where
 
     let pump_buf = crate::tcp_tune::clamp_pump_buffer(buffer_size);
     let (bytes_to_server, bytes_to_client, e_c2s, e_s2c) =
-        run_pumps(inbound, outbound, pump_buf).await;
+        run_pumps(inbound, outbound, pump_buf, Some(client_addr.ip())).await;
 
     if let Some(e) = e_c2s {
         debug!("Client->Server error after {} bytes for {}: {}", bytes_to_server, client_addr, e);
@@ -1362,7 +1362,13 @@ const HALF_CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// that already closed can return ENOTCONN/BrokenPipe, and misclassifying
 /// that would trigger HALF_CLOSE_GRACE instead of waiting indefinitely for
 /// the surviving direction (e.g. a long download after client FIN).
-async fn pump<R, W>(mut r: R, mut w: W, total: &AtomicU64, max_buf: usize) -> Option<io::Error>
+async fn pump<R, W>(
+    mut r: R,
+    mut w: W,
+    total: &AtomicU64,
+    max_buf: usize,
+    limiter: Option<std::sync::Arc<crate::rate_limit::IpRateLimiter>>,
+) -> Option<io::Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1413,6 +1419,11 @@ where
 
         total.fetch_add(n as u64, Ordering::Relaxed);
 
+        // Pay for the transfer; sleeps off any debt beyond the IP's rate.
+        if let Some(ref l) = limiter {
+            l.throttle(n).await;
+        }
+
         // A completely-filled read means the kernel had more queued: double
         // toward the ceiling, unless the global budget is spent.
         if n == buf.len() && buf.len() < max_buf {
@@ -1441,23 +1452,35 @@ where
 /// `buf_size` is the per-direction buffer *ceiling* (from `--buffer-size`,
 /// clamped; 0 → [`PUMP_BUFFER_SIZE`]). Each pump starts at the 8 KiB floor
 /// and adapts within the global memory budget.
+///
+/// `client_ip` keys the optional per-IP speed limit (`--limit-per-ip-mb`):
+/// both directions of every connection from one IP share a token bucket.
 pub(crate) async fn run_pumps<S>(
     inbound: S,
     outbound: TcpStream,
     buf_size: usize,
+    client_ip: Option<std::net::IpAddr>,
 ) -> (u64, u64, Option<io::Error>, Option<io::Error>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let max_buf = crate::tcp_tune::clamp_pump_buffer(buf_size);
+    let mut max_buf = crate::tcp_tune::clamp_pump_buffer(buf_size);
+    let limiter = client_ip.and_then(crate::rate_limit::limiter_for);
+    if let Some(ref l) = limiter {
+        // Chunks are capped near one second of tokens so throttle sleeps
+        // stay short and the flow is paced instead of bursty.
+        max_buf = max_buf
+            .min(l.rate_bytes_per_sec() as usize)
+            .max(crate::tcp_tune::MIN_PUMP_BUFFER);
+    }
     let tx = AtomicU64::new(0); // client -> server
     let rx = AtomicU64::new(0); // server -> client
 
     let (ri, wi) = tokio::io::split(inbound);
     let (ro, wo) = outbound.into_split();
 
-    let c2s = pump(ri, wo, &tx, max_buf);
-    let s2c = pump(ro, wi, &rx, max_buf);
+    let c2s = pump(ri, wo, &tx, max_buf, limiter.clone());
+    let s2c = pump(ro, wi, &rx, max_buf, limiter);
     tokio::pin!(c2s, s2c);
 
     fn grace_expired() -> io::Error {
