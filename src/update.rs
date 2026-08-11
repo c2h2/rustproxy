@@ -36,7 +36,7 @@ pub fn asset_for(os: &str, arch: &str) -> Result<(&'static str, ArchiveKind), St
     };
 
     match (os, arch) {
-        ("linux", "x86_64") => Ok(("rustproxy-linux-amd64.tar.gz", ArchiveKind::TarGz)),
+        ("linux", "x86_64") => Ok(("rustproxy-linux-amd64-musl.tar.gz", ArchiveKind::TarGz)),
         ("linux", "aarch64") => Ok(("rustproxy-linux-arm64-musl.tar.gz", ArchiveKind::TarGz)),
         ("macos", "aarch64") => Ok(("rustproxy-macos-arm64.zip", ArchiveKind::Zip)),
         _ => Err(format!(
@@ -310,12 +310,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asset_for_linux_amd64() {
+    fn asset_for_linux_amd64_prefers_musl() {
+        // The gnu amd64 build is linked against the CI runner's glibc (2.39),
+        // so it refuses to start on older hosts (Ubuntu 22.04 ships 2.35).
+        // Static musl runs everywhere — same reasoning as ARM64 below.
         let (a, k) = asset_for("linux", "x86_64").unwrap();
-        assert_eq!(a, "rustproxy-linux-amd64.tar.gz");
+        assert_eq!(a, "rustproxy-linux-amd64-musl.tar.gz");
         assert_eq!(k, ArchiveKind::TarGz);
         let (a, _) = asset_for("Linux", "amd64").unwrap();
-        assert_eq!(a, "rustproxy-linux-amd64.tar.gz");
+        assert_eq!(a, "rustproxy-linux-amd64-musl.tar.gz");
     }
 
     #[test]

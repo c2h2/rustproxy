@@ -21,7 +21,8 @@ arch=$(uname -m)
 
 case "$os/$arch" in
     Linux/x86_64 | Linux/amd64)
-        asset="rustproxy-linux-amd64.tar.gz"
+        # musl is statically linked → portable across glibc versions
+        asset="rustproxy-linux-amd64-musl.tar.gz"
         archive=tar.gz
         ;;
     Linux/aarch64 | Linux/arm64)
