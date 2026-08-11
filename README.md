@@ -63,11 +63,12 @@ measures **upload + download** through each mode on `127.0.0.1`:
 | `tcp` | client → TCP forward proxy → backend |
 | `socks5` | client → SOCKS5 CONNECT → backend |
 | `http` | client → HTTP `CONNECT` tunnel → backend |
+| `ss` | client → Shadowsocks (AES-256-GCM) → backend |
 
 ```bash
 rustproxy --bench
 rustproxy --bench --size 512
-rustproxy --bench --modes tcp,socks5 --size 128 --warmup 1
+rustproxy --bench --modes tcp,socks5,ss --size 128 --warmup 1
 ```
 
 MB/s is decimal megabytes/sec. Loopback is noisy and is an **upper bound**,
@@ -86,7 +87,7 @@ cargo build --release
 
 ```bash
 rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5|ss> [options]
-rustproxy --bench [--size MiB] [--modes direct,tcp,socks5,http]
+rustproxy --bench [--size MiB] [--modes direct,tcp,socks5,http,ss]
 rustproxy --update
 ```
 

@@ -13,13 +13,23 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tracing::info;
 
+use shadowsocks::config::{ServerConfig, ServerType};
+use shadowsocks::context::Context;
+use shadowsocks::crypto::CipherKind;
+use shadowsocks::relay::socks5::Address;
+use shadowsocks::ProxyClientStream;
+
 use crate::connection_cache::ConnectionCache;
 use crate::http_proxy::HttpProxy;
 use crate::socks5_proxy::Socks5Proxy;
+use crate::ss_proxy::SsProxy;
 use crate::tcp_proxy::TcpProxy;
 
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_SIZE_MIB: usize = 256;
+/// Fixed password for in-process SS bench (not for production).
+const BENCH_SS_PASSWORD: &str = "rustproxy-bench-ss-pass";
+const BENCH_SS_METHOD: CipherKind = CipherKind::AES_256_GCM;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -27,6 +37,7 @@ enum Mode {
     Tcp,
     Socks5,
     Http,
+    Ss,
 }
 
 impl Mode {
@@ -36,6 +47,7 @@ impl Mode {
             Mode::Tcp => "tcp",
             Mode::Socks5 => "socks5",
             Mode::Http => "http",
+            Mode::Ss => "ss",
         }
     }
 
@@ -47,9 +59,10 @@ impl Mode {
                 "tcp" => Mode::Tcp,
                 "socks5" | "socks" => Mode::Socks5,
                 "http" | "connect" => Mode::Http,
+                "ss" | "shadowsocks" => Mode::Ss,
                 other => {
                     return Err(format!(
-                        "unknown bench mode '{}'. Use: direct,tcp,socks5,http",
+                        "unknown bench mode '{}'. Use: direct,tcp,socks5,http,ss",
                         other
                     ));
                 }
@@ -76,7 +89,7 @@ struct ResultRow {
 /// Parse `rustproxy --bench [options]` argv (full process args).
 pub(crate) fn parse_bench_args(args: &[String]) -> Result<(usize, Vec<Mode>, usize), String> {
     let mut size_mib = DEFAULT_SIZE_MIB;
-    let mut modes = vec![Mode::Direct, Mode::Tcp, Mode::Socks5, Mode::Http];
+    let mut modes = vec![Mode::Direct, Mode::Tcp, Mode::Socks5, Mode::Http, Mode::Ss];
     let mut warmup = 1usize;
 
     let mut i = 1;
@@ -133,7 +146,7 @@ fn print_bench_help() {
          \n\
          Options:\n\
            --size <MiB>     Payload size per direction (default: {def})\n\
-           --modes <list>   Comma-separated: direct,tcp,socks5,http (default: all)\n\
+           --modes <list>   Comma-separated: direct,tcp,socks5,http,ss (default: all)\n\
            --warmup <N>     Warm-up iterations discarded before measure (default: 1)\n\
          \n\
          Example:\n\
@@ -183,6 +196,7 @@ pub async fn run_bench(args: &[String]) -> Result<(), String> {
             Mode::Tcp => bench_tcp_mode(backend_addr, total, warmup).await,
             Mode::Socks5 => bench_socks5_mode(backend_addr, total, warmup).await,
             Mode::Http => bench_http_mode(backend_addr, total, warmup).await,
+            Mode::Ss => bench_ss_mode(backend_addr, total, warmup).await,
         };
         rows.push(row);
     }
@@ -224,10 +238,11 @@ async fn run_bench_backend(listener: TcpListener, send_bytes: Arc<AtomicU64>) {
     }
 }
 
-async fn measure_mode<F, Fut>(mode: Mode, total: u64, warmup: usize, connect: F) -> ResultRow
+async fn measure_mode<F, Fut, S>(mode: Mode, total: u64, warmup: usize, connect: F) -> ResultRow
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TcpStream, std::io::Error>>,
+    Fut: std::future::Future<Output = Result<S, std::io::Error>>,
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     for _ in 0..warmup {
         if let Ok(s) = connect().await {
@@ -257,17 +272,26 @@ where
     }
 }
 
-async fn run_upload_download(
-    mut stream: TcpStream,
-    total: u64,
-) -> Result<(f64, f64, f64, f64), String> {
-    let _ = stream.set_nodelay(true);
+async fn run_upload_download<S>(mut stream: S, total: u64) -> Result<(f64, f64, f64, f64), String>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     let data = vec![0xCDu8; CHUNK];
 
     let t0 = Instant::now();
     let mut sent = 0u64;
+    // First write is intentionally small: Shadowsocks `ProxyClientStream`
+    // concatenates the target address into the first encrypted packet and
+    // asserts the whole buffer is written at once (debug builds panic if the
+    // first write is multi‑MiB and gets a partial encrypted write).
+    const FIRST_WRITE: usize = 4 * 1024;
     while sent < total {
-        let n = ((total - sent) as usize).min(CHUNK);
+        let remain = (total - sent) as usize;
+        let n = if sent == 0 {
+            remain.min(FIRST_WRITE)
+        } else {
+            remain.min(CHUNK)
+        };
         stream
             .write_all(&data[..n])
             .await
@@ -496,6 +520,63 @@ async fn bench_http_mode(backend: SocketAddr, total: u64, warmup: usize) -> Resu
     row
 }
 
+async fn bench_ss_mode(backend: SocketAddr, total: u64, warmup: usize) -> ResultRow {
+    let listen = match pick_free_addr().await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("  [ss] {}", e);
+            return fail_row(Mode::Ss, "bind error");
+        }
+    };
+    let bind = listen.to_string();
+    let proxy = SsProxy::with_stats(
+        &bind,
+        BENCH_SS_PASSWORD.to_string(),
+        BENCH_SS_METHOD,
+        None,
+        256 * 1024,
+    );
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            r = proxy.start() => {
+                if let Err(e) = r {
+                    eprintln!("  [ss] proxy error: {}", e);
+                }
+            }
+            _ = kill_rx => {}
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let target = Address::from(backend);
+    let svr_cfg = match ServerConfig::new(listen, BENCH_SS_PASSWORD, BENCH_SS_METHOD) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("  [ss] config error: {}", e);
+            let _ = kill_tx.send(());
+            task.abort();
+            let _ = task.await;
+            return fail_row(Mode::Ss, "config error");
+        }
+    };
+
+    let row = measure_mode(Mode::Ss, total, warmup, move || {
+        let cfg = svr_cfg.clone();
+        let tgt = target.clone();
+        async move {
+            let ctx = Context::new_shared(ServerType::Local);
+            ProxyClientStream::connect(ctx, &cfg, tgt).await
+        }
+    })
+    .await;
+
+    let _ = kill_tx.send(());
+    task.abort();
+    let _ = task.await;
+    row
+}
+
 async fn http_connect_stream(proxy: SocketAddr, authority: &str) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(proxy).await?;
     let _ = s.set_nodelay(true);
@@ -613,5 +694,20 @@ mod tests {
             "0".into(),
         ];
         run_bench(&args).await.expect("bench smoke");
+    }
+
+    #[tokio::test]
+    async fn bench_ss_smoke() {
+        let args = vec![
+            "rustproxy".into(),
+            "--bench".into(),
+            "--size".into(),
+            "1".into(),
+            "--modes".into(),
+            "ss".into(),
+            "--warmup".into(),
+            "0".into(),
+        ];
+        run_bench(&args).await.expect("ss bench smoke");
     }
 }

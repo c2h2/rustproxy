@@ -46,9 +46,9 @@ fn print_usage() {
     println!("                               the running executable in place");
     println!();
     println!("Self-bench (localhost loopback):");
-    println!("  --bench                      Throughput test: direct + tcp + socks5 + http");
+    println!("  --bench                      Throughput test: direct + tcp + socks5 + http + ss");
     println!("  --size <MiB>                 Payload per direction (default: 256)");
-    println!("  --modes direct,tcp,socks5,http   Subset of modes (default: all)");
+    println!("  --modes direct,tcp,socks5,http,ss   Subset of modes (default: all)");
     println!("  --warmup <N>                 Discarded warm-up runs (default: 1)");
     println!();
     println!("Manager Mode:");
