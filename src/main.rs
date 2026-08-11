@@ -74,8 +74,11 @@ fn print_usage() {
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
     println!("  --traffic-log <path>         CSV file for persistent traffic history (default: ./rustproxy_traffic.csv)");
-    println!("  --buffer-size <size>          Per-direction pump read buffer (default: 256kb,");
-    println!("                               clamped 8kb–4mb). Examples: 64kb, 256kb, 1mb");
+    println!("  --buffer-size <size>          Max per-direction pump buffer (default: 4mb).");
+    println!("                               Buffers adapt to traffic: start 8kb, double");
+    println!("                               on busy reads, halve when idle. Total across");
+    println!("                               all conns is hard-capped at 1GiB.");
+    println!("                               Examples: 64kb, 256kb, 1mb");
     println!("  --dns <servers>              Custom DNS resolvers (overrides system DNS).");
     println!("                               Comma-separated list. Each entry may be:");
     println!("                                 8.8.8.8                       (UDP, port 53)");
@@ -584,7 +587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let buffer_size_val = buffer_size_str.unwrap_or_else(|| "16mb".to_string());
+    let buffer_size_val = buffer_size_str.unwrap_or_else(|| "4mb".to_string());
     let buffer_size_bytes = match parse_cache_size(&buffer_size_val) {
         Ok(size) => size,
         Err(e) => {

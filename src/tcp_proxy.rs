@@ -1362,15 +1362,35 @@ const HALF_CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// that already closed can return ENOTCONN/BrokenPipe, and misclassifying
 /// that would trigger HALF_CLOSE_GRACE instead of waiting indefinitely for
 /// the surviving direction (e.g. a long download after client FIN).
-async fn pump<R, W>(mut r: R, mut w: W, total: &AtomicU64, buf_size: usize) -> Option<io::Error>
+async fn pump<R, W>(mut r: R, mut w: W, total: &AtomicU64, max_buf: usize) -> Option<io::Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; buf_size];
+    use crate::tcp_tune::{IDLE_SHRINK_AFTER, IDLE_SHRINK_MIN};
+
+    // Adaptive buffer: start at the 8 KiB floor, double (budget permitting)
+    // whenever a read comes back completely full, halve after idle periods.
+    let mut lease = crate::tcp_tune::global_pump_budget().reserve_min();
+    let mut buf = vec![0u8; lease.size()];
 
     loop {
-        let n = match r.read(&mut buf).await {
+        // A pump holding a grown buffer bounds its read with a timer so an
+        // idle connection hands memory back instead of pinning its peak.
+        let read = if buf.len() > IDLE_SHRINK_MIN {
+            match timeout(IDLE_SHRINK_AFTER, r.read(&mut buf)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    lease.shrink_to(buf.len() / 2);
+                    buf = vec![0u8; lease.size()];
+                    continue;
+                }
+            }
+        } else {
+            r.read(&mut buf).await
+        };
+
+        let n = match read {
             Ok(0) => {
                 let _ = w.shutdown().await;
                 return None;
@@ -1392,6 +1412,15 @@ where
         }
 
         total.fetch_add(n as u64, Ordering::Relaxed);
+
+        // A completely-filled read means the kernel had more queued: double
+        // toward the ceiling, unless the global budget is spent.
+        if n == buf.len() && buf.len() < max_buf {
+            let target = (buf.len() * 2).min(max_buf);
+            if lease.try_grow_to(target) {
+                buf = vec![0u8; lease.size()];
+            }
+        }
     }
 }
 
@@ -1409,8 +1438,9 @@ where
 /// so they all get the same leak-free teardown: an abrupt close on one side
 /// can never leave the other direction (and both sockets) hanging forever.
 ///
-/// `buf_size` is the per-direction userspace read buffer (from `--buffer-size`,
-/// clamped). When 0, uses [`PUMP_BUFFER_SIZE`].
+/// `buf_size` is the per-direction buffer *ceiling* (from `--buffer-size`,
+/// clamped; 0 → [`PUMP_BUFFER_SIZE`]). Each pump starts at the 8 KiB floor
+/// and adapts within the global memory budget.
 pub(crate) async fn run_pumps<S>(
     inbound: S,
     outbound: TcpStream,
@@ -1419,15 +1449,15 @@ pub(crate) async fn run_pumps<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let buf_size = crate::tcp_tune::clamp_pump_buffer(buf_size);
+    let max_buf = crate::tcp_tune::clamp_pump_buffer(buf_size);
     let tx = AtomicU64::new(0); // client -> server
     let rx = AtomicU64::new(0); // server -> client
 
     let (ri, wi) = tokio::io::split(inbound);
     let (ro, wo) = outbound.into_split();
 
-    let c2s = pump(ri, wo, &tx, buf_size);
-    let s2c = pump(ro, wi, &rx, buf_size);
+    let c2s = pump(ri, wo, &tx, max_buf);
+    let s2c = pump(ro, wi, &rx, max_buf);
     tokio::pin!(c2s, s2c);
 
     fn grace_expired() -> io::Error {
@@ -1813,7 +1843,7 @@ mod tests {
     /// `--buffer-size` is clamped into the pump buffer range.
     #[test]
     fn pump_buffer_clamp_honors_cli_size() {
-        assert_eq!(PUMP_BUFFER_SIZE, 256 * 1024);
+        assert_eq!(PUMP_BUFFER_SIZE, 4 * 1024 * 1024);
         assert_eq!(crate::tcp_tune::clamp_pump_buffer(0), PUMP_BUFFER_SIZE);
         assert_eq!(
             crate::tcp_tune::clamp_pump_buffer(64 * 1024),

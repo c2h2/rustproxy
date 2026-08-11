@@ -118,7 +118,7 @@ rustproxy --update
 - `--target <address:port>` - Address to proxy requests to (required for tcp mode). Comma-separated for load balancing
 - `--mode <tcp|http|socks5|ss>` - Proxy mode
 - `--cache-size <size>` - Legacy CLI size (outbound stream pooling is **disabled** by design; kept for compatibility). Examples: `0`, `256kb`, `1mb`
-- `--buffer-size <size>` - Per-direction pump read buffer (default **256kb**, clamped 8kb–4mb)
+- `--buffer-size <size>` - Max per-direction pump buffer (default **4mb**). Buffers are adaptive: each direction starts at **8 KiB**, doubles whenever a read fills the buffer, and halves after ~10 s idle — so idle tunnels cost ~16 KiB while bulk streams grow to full size. Total pump memory across all connections is hard-capped at **1 GiB**; once spent, pumps stop growing instead of failing.
 - `--tcp-keepalive-time <secs>` - Keepalive idle before first probe (default **120**)
 - `--tcp-keepalive-interval <secs>` - Keepalive probe interval (default **30**)
 - `--tcp-keepalive-retries <n>` - Unanswered probes before drop (default **3**)

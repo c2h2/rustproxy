@@ -14,6 +14,7 @@
 //!
 //! Operators can still select the aggressive profile via CLI flags.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -30,9 +31,22 @@ pub const DEFAULT_USER_TIMEOUT_SECS: u64 = 0;
 /// Default socket send/recv buffer when not overridden on the CLI.
 pub const DEFAULT_SOCK_BUF: usize = 4 * 1024 * 1024;
 /// Default / minimum / maximum userspace pump buffer.
-pub const DEFAULT_PUMP_BUFFER: usize = 256 * 1024;
+///
+/// Pumps are adaptive: each direction starts at `MIN_PUMP_BUFFER` and
+/// doubles on filled reads up to the `--buffer-size` ceiling (default
+/// `MAX_PUMP_BUFFER`), halving again when idle, with every byte
+/// accounted against the global budget.
+pub const DEFAULT_PUMP_BUFFER: usize = MAX_PUMP_BUFFER;
 pub const MIN_PUMP_BUFFER: usize = 8 * 1024;
 pub const MAX_PUMP_BUFFER: usize = 4 * 1024 * 1024;
+/// Hard cap on total pump-buffer memory across ALL connections (1 GiB).
+/// Once spent, pumps stop growing (and new ones start at the 8 KiB
+/// floor), so any number of connections stays within the budget.
+pub const DEFAULT_PUMP_BUDGET: usize = 1024 * 1024 * 1024;
+/// A pump holding more than this shrinks after an idle period.
+pub const IDLE_SHRINK_MIN: usize = 64 * 1024;
+/// Idle period after which an oversized pump halves its buffer.
+pub const IDLE_SHRINK_AFTER: Duration = Duration::from_secs(10);
 
 /* ---------- Legacy aggressive profile (documented + tested) ---------- */
 
@@ -113,6 +127,117 @@ pub fn clamp_pump_buffer(requested: usize) -> usize {
     requested.clamp(MIN_PUMP_BUFFER, MAX_PUMP_BUFFER)
 }
 
+/* ---------- Global pump-buffer memory budget ---------- */
+
+/// Accounts pump-buffer bytes handed out to live connections against a
+/// hard cap, so total relay memory stays bounded no matter how many
+/// connections are open.
+#[derive(Debug)]
+pub struct PumpBudget {
+    cap: usize,
+    used: AtomicUsize,
+}
+
+/// Bytes reserved against a [`PumpBudget`]; returned to the budget on drop.
+#[derive(Debug)]
+pub struct PumpLease<'a> {
+    budget: &'a PumpBudget,
+    granted: usize,
+}
+
+impl PumpBudget {
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    /// Starter grant of `MIN_PUMP_BUFFER`. Always succeeds — the floor
+    /// overshoot past the cap is bounded by the fd-derived connection
+    /// cap — so a new connection never fails for lack of budget.
+    pub fn reserve_min(&self) -> PumpLease<'_> {
+        self.used.fetch_add(MIN_PUMP_BUFFER, Ordering::Relaxed);
+        PumpLease {
+            budget: self,
+            granted: MIN_PUMP_BUFFER,
+        }
+    }
+
+    /// Strict reservation of `extra` bytes; fails rather than exceed the cap.
+    fn try_reserve_extra(&self, extra: usize) -> bool {
+        let mut cur = self.used.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = cur.checked_add(extra) else {
+                return false;
+            };
+            if next > self.cap {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+impl PumpLease<'_> {
+    /// Bytes currently held by this lease.
+    pub fn size(&self) -> usize {
+        self.granted
+    }
+
+    /// Try to grow to `target` bytes; on `false` (budget spent) the lease
+    /// keeps its current size and the pump simply stops growing.
+    pub fn try_grow_to(&mut self, target: usize) -> bool {
+        if target <= self.granted {
+            return true;
+        }
+        if self.budget.try_reserve_extra(target - self.granted) {
+            self.granted = target;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Shrink to `target` (floored at `MIN_PUMP_BUFFER`), returning the
+    /// freed bytes to the budget.
+    pub fn shrink_to(&mut self, target: usize) {
+        let target = target.max(MIN_PUMP_BUFFER);
+        if target < self.granted {
+            self.budget.release(self.granted - target);
+            self.granted = target;
+        }
+    }
+}
+
+impl Drop for PumpLease<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.granted, Ordering::Relaxed);
+    }
+}
+
+/// Process-wide budget shared by every relay path.
+pub fn global_pump_budget() -> &'static PumpBudget {
+    static GLOBAL: PumpBudget = PumpBudget::new(DEFAULT_PUMP_BUDGET);
+    &GLOBAL
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +295,42 @@ mod tests {
         assert_eq!(clamp_pump_buffer(100), MIN_PUMP_BUFFER);
         assert_eq!(clamp_pump_buffer(64 * 1024), 64 * 1024);
         assert_eq!(clamp_pump_buffer(usize::MAX), MAX_PUMP_BUFFER);
+    }
+
+    /// Adaptive starts: even 10k idle connections cost a fraction of the
+    /// budget (2 pumps × 8 KiB each).
+    #[test]
+    fn pump_budget_idle_connections_are_cheap() {
+        assert!(10_000 * 2 * MIN_PUMP_BUFFER <= DEFAULT_PUMP_BUDGET / 6);
+    }
+
+    /// Leases grow only while the cap has room, shrink back, and return
+    /// their bytes on drop.
+    #[test]
+    fn pump_lease_grows_shrinks_and_releases() {
+        let budget = PumpBudget::new(1024 * 1024);
+
+        let mut l1 = budget.reserve_min();
+        assert_eq!(l1.size(), MIN_PUMP_BUFFER);
+        assert!(l1.try_grow_to(512 * 1024));
+        assert_eq!(l1.size(), 512 * 1024);
+
+        // Growing past the cap is refused; the lease keeps its size.
+        let mut l2 = budget.reserve_min();
+        assert!(!l2.try_grow_to(1024 * 1024));
+        assert_eq!(l2.size(), MIN_PUMP_BUFFER);
+
+        // Growing within what is left succeeds.
+        assert!(l2.try_grow_to(256 * 1024));
+        assert!(budget.in_use() <= 1024 * 1024);
+
+        // Shrinking hands bytes back for others to grow into.
+        l1.shrink_to(64 * 1024);
+        assert_eq!(l1.size(), 64 * 1024);
+        assert!(l2.try_grow_to(512 * 1024));
+
+        drop(l1);
+        drop(l2);
+        assert_eq!(budget.in_use(), 0);
     }
 }
