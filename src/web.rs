@@ -158,13 +158,28 @@ async fn api_enable_backend(
 async fn api_disable_backend(
     State(state): State<Arc<WebState>>,
     Path(id): Path<usize>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if state.lb.disable_backend(id) {
+    // Default: drain in-flight (stop new traffic only). `?kill=1` aborts live relays.
+    let kill = matches!(
+        q.get("kill").map(|s| s.as_str()),
+        Some("1") | Some("true") | Some("yes")
+    );
+    let ok = if kill {
+        state.lb.disable_backend_kill(id)
+    } else {
+        state.lb.disable_backend(id)
+    };
+    if ok {
         (
             StatusCode::OK,
             Json(ActionResponse {
                 ok: true,
-                message: format!("Backend {} disabled", id),
+                message: if kill {
+                    format!("Backend {} disabled (in-flight killed)", id)
+                } else {
+                    format!("Backend {} disabled (in-flight drain)", id)
+                },
             }),
         )
     } else {

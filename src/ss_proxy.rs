@@ -94,8 +94,8 @@ impl SsProxy {
             None
         };
 
-        // Connect to the real target
-        let target_stream = match crate::dns::tcp_connect(&target_str).await {
+        // Connect to the real target (bounded — silent peers must not hang forever).
+        let target_stream = match crate::dns::tcp_connect_timeout(&target_str).await {
             Ok(s) => s,
             Err(e) => {
                 warn!("SS failed to connect to {}: {}", target_str, e);
@@ -122,10 +122,6 @@ impl SsProxy {
         stats: Option<Arc<StatsCollector>>,
         conn_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // buffer_size is retained for CLI/config compatibility; the shared
-        // relay uses socket buffers for backpressure instead of a duplex pipe.
-        let _ = self.buffer_size;
-
         // Keep the target leg warm through NATs and detect dead peers.
         // (Client side is an SS-encrypted stream, not a plain TcpStream.)
         crate::tcp_proxy::tune_tcp_stream(&target_stream);
@@ -138,7 +134,7 @@ impl SsProxy {
         // run_pumps fixes both: it half-closes the peer on EOF and tears the
         // relay down once a broken direction's drain grace expires.
         let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) =
-            crate::tcp_proxy::run_pumps(client_stream, target_stream).await;
+            crate::tcp_proxy::run_pumps(client_stream, target_stream, self.buffer_size).await;
 
         if let Some(e) = e_c2s {
             debug!("SS client->target ended after {} bytes for {}: {}", bytes_to_target, client_addr, e);

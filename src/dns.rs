@@ -150,14 +150,22 @@ pub fn resolver() -> Option<Arc<TokioAsyncResolver>> {
     GLOBAL_RESOLVER.get().cloned()
 }
 
-/// Resolve `host:port` to a `SocketAddr`. Uses the configured resolver if set,
-/// otherwise falls back to the system resolver (Tokio's default behavior).
+/// Resolve `host:port` to a single `SocketAddr` (first of `resolve_all`).
+/// Prefer `resolve_all` / `tcp_connect` when connect-time failover matters.
 pub async fn resolve(addr: &str) -> io::Result<SocketAddr> {
+    let addrs = resolve_all(addr).await?;
+    addrs.into_iter().next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {}", addr))
+    })
+}
+
+/// Resolve `host:port` to **all** candidate addresses (A/AAAA order from the
+/// resolver). IP literals return a one-element list.
+pub async fn resolve_all(addr: &str) -> io::Result<Vec<SocketAddr>> {
     let (host, port) = parse_host_port(addr)?;
 
-    // Already an IP literal — no DNS needed
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     if let Some(r) = resolver() {
@@ -165,20 +173,27 @@ pub async fn resolve(addr: &str) -> io::Result<SocketAddr> {
             .lookup_ip(host)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("dns: {}", e)))?;
-        // First record only — no Happy Eyeballs / multi-IP retry.
-        let ip = first_ip(lookup.iter()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no records for {}", host))
-        })?;
-        return Ok(SocketAddr::new(ip, port));
+        let addrs: Vec<SocketAddr> = lookup.iter().map(|ip| SocketAddr::new(ip, port)).collect();
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no records for {}", host),
+            ));
+        }
+        return Ok(addrs);
     }
 
-    // System fallback — also first address only.
-    first_socket_addr(tokio::net::lookup_host(addr).await?)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {}", addr)))
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no addresses for {}", addr),
+        ));
+    }
+    Ok(addrs)
 }
 
-/// Pick the first IP from a resolver result. Exposed for characterization
-/// tests: the proxy never tries later addresses if the first is unreachable.
+/// Pick the first IP (kept for unit tests / callers that only need one).
 pub(crate) fn first_ip(mut ips: impl Iterator<Item = IpAddr>) -> Option<IpAddr> {
     ips.next()
 }
@@ -188,6 +203,29 @@ pub(crate) fn first_socket_addr(
     mut addrs: impl Iterator<Item = SocketAddr>,
 ) -> Option<SocketAddr> {
     addrs.next()
+}
+
+/// Try connecting to each candidate address in order until one succeeds.
+/// This is the multi-IP fix for dual-stack / multi-A hosts where the first
+/// record is unreachable but a later one works.
+pub async fn tcp_connect_addrs(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> io::Result<tokio::net::TcpStream> {
+    let mut last_err: Option<io::Error> = None;
+    let mut tried = 0u32;
+    for sa in addrs {
+        tried += 1;
+        match tokio::net::TcpStream::connect(sa).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no addresses to connect (tried {})", tried),
+        )
+    }))
 }
 
 fn parse_host_port(addr: &str) -> io::Result<(&str, u16)> {
@@ -211,11 +249,25 @@ fn parse_host_port(addr: &str) -> io::Result<(&str, u16)> {
     Ok((h, port))
 }
 
-/// Connect to `addr` (host:port), routing the lookup through the configured
-/// resolver when set.
+/// Connect to `addr` (host:port), trying every resolved address until one
+/// accepts. Lookup goes through the configured resolver when set.
 pub async fn tcp_connect(addr: &str) -> io::Result<tokio::net::TcpStream> {
-    let sa = resolve(addr).await?;
-    tokio::net::TcpStream::connect(sa).await
+    let addrs = resolve_all(addr).await?;
+    tcp_connect_addrs(addrs).await
+}
+
+/// Default bound for outbound TCP connect attempts (plain / SOCKS5 / SS).
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `tcp_connect` wrapped in [`CONNECT_TIMEOUT`].
+pub async fn tcp_connect_timeout(addr: &str) -> io::Result<tokio::net::TcpStream> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, tcp_connect(addr)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connection timeout to {} after {:?}", addr, CONNECT_TIMEOUT),
+        )),
+    }
 }
 
 /// Hyper-compatible resolver that delegates to the configured upstream DNS.
@@ -308,11 +360,8 @@ mod tests {
         assert!(err.contains("exceeds maximum"), "got: {}", err);
     }
 
-    /// Characterization: when multiple IPs are available, only the first is
-    /// used — no Happy Eyeballs / failover. A dead first A/AAAA therefore
-    /// fails the connect even if a later address would work.
     #[test]
-    fn resolve_selects_only_the_first_ip() {
+    fn first_helpers_pick_head_of_list() {
         let a: IpAddr = "1.1.1.1".parse().unwrap();
         let b: IpAddr = "8.8.8.8".parse().unwrap();
         let c: IpAddr = "9.9.9.9".parse().unwrap();
@@ -323,6 +372,45 @@ mod tests {
         let sa2 = SocketAddr::new(b, 443);
         assert_eq!(first_socket_addr([sa1, sa2].into_iter()), Some(sa1));
         assert_eq!(first_socket_addr(std::iter::empty()), None);
+    }
+
+    /// P1 fix: when the first candidate refuses, later addresses are tried.
+    #[tokio::test]
+    async fn tcp_connect_addrs_falls_through_dead_first_ip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.unwrap();
+            let _ = s.write_all(&buf[..n]).await;
+        });
+
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stream = tcp_connect_addrs([dead, live].into_iter())
+            .await
+            .expect("must succeed via second address");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(b"ok").await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ok");
+    }
+
+    /// Reproduce the pre-fix failure: connecting only the dead head errors.
+    #[tokio::test]
+    async fn first_only_connect_fails_when_head_is_dead() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let _keep = listener;
+
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(dead).await.is_err(),
+            "dead head must fail alone"
+        );
+        assert!(tcp_connect_addrs([dead, live]).await.is_ok());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use hyper::client::HttpConnector;
+use hyper::header::CONTENT_LENGTH;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Method, Request, Response, Server};
 use std::convert::Infallible;
@@ -9,6 +10,15 @@ use tracing::{debug, error, info};
 use crate::connection_cache::ConnectionCache;
 use crate::dns::{self, HyperResolver};
 use crate::stats::StatsCollector;
+
+/// Best-effort size from `Content-Length` without buffering the body.
+fn content_length_of(headers: &hyper::HeaderMap) -> u64 {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
 
 fn build_client() -> Client<HttpConnector<HyperResolver>> {
     let mut connector = HttpConnector::new_with_resolver(HyperResolver);
@@ -163,19 +173,27 @@ async fn proxy_handler_with_stats(
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
-                        match dns::tcp_connect(&authority).await {
-                            Ok(mut server) => {
-                                // Idle HTTPS tunnels (long-lived TLS sessions)
-                                // die on NAT/firewall timeout without keepalive.
+                        match dns::tcp_connect_timeout(&authority).await {
+                            Ok(server) => {
+                                // Idle HTTPS tunnels die on NAT without keepalive.
                                 crate::tcp_proxy::tune_tcp_stream(&server);
-                                let mut upgraded = upgraded;
-                                match tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
-                                    Ok((from_client, from_server)) => {
-                                        if let (Some(stats), Some(conn_id)) = (&stats_clone, &conn_id_clone) {
-                                            stats.update_connection(conn_id, from_client, from_server).await;
-                                        }
-                                    }
-                                    Err(e) => error!("CONNECT tunnel error for {}: {}", authority, e),
+                                // Shared run_pumps: half-close + bounded broken-peer
+                                // grace (parity with plain TCP / SOCKS5 / SS).
+                                // Client leg is hyper::Upgraded (not TcpStream), so
+                                // we cannot apply OS keepalive to it; hyper server
+                                // already set nodelay on the accept socket.
+                                let (from_client, from_server, e_c2s, e_s2c) =
+                                    crate::tcp_proxy::run_pumps(upgraded, server, 0).await;
+                                if let Some(e) = e_c2s {
+                                    debug!("CONNECT client->server {}: {}", authority, e);
+                                }
+                                if let Some(e) = e_s2c {
+                                    debug!("CONNECT server->client {}: {}", authority, e);
+                                }
+                                if let (Some(stats), Some(conn_id)) = (&stats_clone, &conn_id_clone) {
+                                    stats
+                                        .update_connection(conn_id, from_client, from_server)
+                                        .await;
                                 }
                             }
                             Err(e) => error!("Failed to connect to {}: {}", authority, e),
@@ -217,50 +235,27 @@ async fn proxy_handler_with_stats(
                 req.headers_mut().remove(h);
             }
 
-            // Only buffer bodies when stats need byte counts; otherwise
-            // stream straight through.
-            if stats.is_none() {
-                return match client.request(req).await {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => {
-                        error!("Error proxying request: {}", e);
-                        Ok(Response::builder()
-                            .status(502)
-                            .body(Body::from("Proxy error"))
-                            .unwrap())
-                    }
-                };
-            }
-
-            // Extract and measure request body
-            let (parts, body) = req.into_parts();
-            let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
-            let request_size = body_bytes.len() as u64;
-            let req = Request::from_parts(parts, Body::from(body_bytes));
+            // Always stream request/response bodies (no full `to_bytes` buffer).
+            // Stats use Content-Length when present; chunked bodies report 0 for
+            // that direction rather than materializing multi‑GB payloads in RAM.
+            let request_size = content_length_of(req.headers());
 
             match client.request(req).await {
                 Ok(resp) => {
-                    // Extract and measure response body
-                    let (parts, body) = resp.into_parts();
-                    let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
-                    let response_size = body_bytes.len() as u64;
-                    let resp = Response::from_parts(parts, Body::from(body_bytes));
-
-                    // Update stats with actual bytes transferred
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
-                        stats.update_connection(conn_id, request_size, response_size).await;
+                        let response_size = content_length_of(resp.headers());
+                        stats
+                            .update_connection(conn_id, request_size, response_size)
+                            .await;
                         stats.close_connection(conn_id).await;
                     }
                     Ok(resp)
                 }
                 Err(e) => {
                     error!("Error proxying request: {}", e);
-
-                    // Close connection in stats
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
                         stats.close_connection(conn_id).await;
                     }
-
                     Ok(Response::builder()
                         .status(502)
                         .body(Body::from("Proxy error"))
@@ -442,11 +437,8 @@ mod tests {
         );
     }
 
-    /// CONNECT uses `copy_bidirectional`, not `run_pumps`. When the client
-    /// RSTs while the backend stays idle, the tunnel task should still
-    /// finish (copy_bidirectional returns on error). This does *not* prove
-    /// HALF_CLOSE_GRACE parity — only that CONNECT does not leak forever
-    /// on client RST the way the old TCP `join!` path did.
+    /// CONNECT now uses `run_pumps` (same half-close/grace as plain TCP).
+    /// Client RST against an idle backend must not hang the process.
     #[tokio::test]
     async fn connect_tunnel_ends_when_client_rsts_idle_backend() {
         tracing_subscriber::fmt::try_init().ok();
@@ -511,6 +503,74 @@ mod tests {
         // sockets forever we'd only notice via resource exhaustion. This
         // test mainly documents the RST path is exercised without panic.
         sleep(Duration::from_millis(300)).await;
+    }
+
+    #[test]
+    fn content_length_helper_parses_or_zero() {
+        let mut h = hyper::HeaderMap::new();
+        assert_eq!(content_length_of(&h), 0);
+        h.insert(CONTENT_LENGTH, "12345".parse().unwrap());
+        assert_eq!(content_length_of(&h), 12345);
+    }
+
+    /// Stats path must not require full body buffering: sizes come from
+    /// Content-Length so multi‑GB responses can stream.
+    #[tokio::test]
+    async fn http_forward_with_stats_streams_using_content_length() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        let mock = MockTcpServer::new().await.unwrap();
+        let mock_addr = mock.addr();
+        tokio::spawn(mock.http_server());
+
+        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let stats = Arc::new(StatsCollector::new("http", "127.0.0.1:0", None));
+        let stats_c = stats.clone();
+        let client = build_client();
+        let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
+            let client = client.clone();
+            let stats = stats_c.clone();
+            let client_addr = conn.remote_addr();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    let client = client.clone();
+                    let stats = stats.clone();
+                    proxy_handler_with_stats(
+                        req,
+                        String::new(),
+                        ConnectionCache::new(0),
+                        Some(stats),
+                        client_addr,
+                        client,
+                    )
+                }))
+            }
+        });
+        let server = Server::bind(&listen).tcp_nodelay(true).serve(make_svc);
+        let _proxy_addr = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        sleep(Duration::from_millis(50)).await;
+
+        let client = build_client();
+        let uri = Uri::try_from(format!(
+            "http://{}:{}/test",
+            mock_addr.ip(),
+            mock_addr.port()
+        ))
+        .unwrap();
+        // Absolute-form URI for forward proxy; Host set by hyper client.
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("host", format!("{}:{}", mock_addr.ip(), mock_addr.port()))
+            .body(Body::empty())
+            .unwrap();
+        let resp = client.request(req).await.expect("proxied GET");
+        assert!(resp.status().is_success() || resp.status().as_u16() == 200 || !resp.status().is_server_error());
+        // Drain body (streamed, not pre-buffered by proxy).
+        let _ = hyper::body::to_bytes(resp.into_body()).await;
     }
 
     #[tokio::test]

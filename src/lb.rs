@@ -162,27 +162,44 @@ impl LoadBalancer {
 
     /// Pick the next enabled backend according to the configured algorithm.
     /// Returns `None` if all backends are disabled.
+    ///
+    /// Allocation-free: walks the backend slice and counts enabled entries
+    /// instead of building a temporary `Vec` on every accept.
     pub fn next_backend(&self) -> Option<Arc<Backend>> {
-        let enabled: Vec<&Arc<Backend>> = self
-            .backends
-            .iter()
-            .filter(|b| b.enabled.load(Ordering::Relaxed))
-            .collect();
-
-        if enabled.is_empty() {
+        let n = self.backends.len();
+        if n == 0 {
             return None;
         }
 
-        match self.algorithm {
-            LbAlgorithm::RoundRobin => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % enabled.len();
-                Some(Arc::clone(enabled[idx]))
-            }
-            LbAlgorithm::Random => {
-                let idx = rand::thread_rng().gen_range(0..enabled.len());
-                Some(Arc::clone(enabled[idx]))
+        // Count enabled without allocating.
+        let mut enabled_count = 0usize;
+        for b in &self.backends {
+            if b.enabled.load(Ordering::Relaxed) {
+                enabled_count += 1;
             }
         }
+        if enabled_count == 0 {
+            return None;
+        }
+
+        let pick = match self.algorithm {
+            LbAlgorithm::RoundRobin => {
+                self.rr_counter.fetch_add(1, Ordering::Relaxed) % enabled_count
+            }
+            LbAlgorithm::Random => rand::thread_rng().gen_range(0..enabled_count),
+        };
+
+        let mut seen = 0usize;
+        for b in &self.backends {
+            if !b.enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+            if seen == pick {
+                return Some(Arc::clone(b));
+            }
+            seen += 1;
+        }
+        None
     }
 
     pub fn enable_backend(&self, id: usize) -> bool {
@@ -197,12 +214,26 @@ impl LoadBalancer {
         }
     }
 
+    /// Admin-disable a backend: stop sending **new** connections.
+    /// In-flight streams **drain** (same as healthcheck). Use
+    /// [`disable_backend_kill`] to also abort live relays.
     pub fn disable_backend(&self, id: usize) -> bool {
+        self.disable_backend_inner(id, false)
+    }
+
+    /// Admin-disable and immediately kill every relay waiting on this backend.
+    pub fn disable_backend_kill(&self, id: usize) -> bool {
+        self.disable_backend_inner(id, true)
+    }
+
+    fn disable_backend_inner(&self, id: usize, kill_inflight: bool) -> bool {
         if let Some(b) = self.backends.iter().find(|b| b.id == id) {
             b.admin_disabled.store(true, Ordering::Relaxed);
             b.enabled.store(false, Ordering::Relaxed);
             b.stats.hc_status.store(4, Ordering::Relaxed); // admin_disabled
-            b.kill_active();
+            if kill_inflight {
+                b.kill_active();
+            }
             true
         } else {
             false
@@ -274,8 +305,9 @@ mod tests {
         );
     }
 
+    /// P1: default admin disable drains — does NOT wake wait_kill.
     #[tokio::test]
-    async fn disable_backend_kills_active() {
+    async fn disable_backend_drains_without_killing() {
         let lb = LoadBalancer::new("127.0.0.1:1", LbAlgorithm::RoundRobin).unwrap();
         let backend = lb.backends()[0].clone();
 
@@ -284,10 +316,49 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(lb.disable_backend(0));
+        assert!(!backend.enabled.load(Ordering::Relaxed));
+        assert!(backend.admin_disabled.load(Ordering::Relaxed));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "default admin disable must drain, not kill in-flight"
+        );
+        // New picks must skip the disabled backend.
+        assert!(lb.next_backend().is_none());
+        waiter.abort();
+    }
+
+    /// Explicit kill path still aborts in-flight relays.
+    #[tokio::test]
+    async fn disable_backend_kill_wakes_waiters() {
+        let lb = LoadBalancer::new("127.0.0.1:1", LbAlgorithm::RoundRobin).unwrap();
+        let backend = lb.backends()[0].clone();
+
+        let b1 = backend.clone();
+        let waiter = tokio::spawn(async move { b1.wait_kill().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(lb.disable_backend_kill(0));
 
         tokio::time::timeout(Duration::from_millis(200), waiter)
             .await
-            .expect("disable_backend did not propagate kill")
+            .expect("disable_backend_kill did not propagate kill")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_backend_skips_disabled_without_alloc_path() {
+        let lb = LoadBalancer::new(
+            "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+            LbAlgorithm::RoundRobin,
+        )
+        .unwrap();
+        assert!(lb.disable_backend(1));
+        // All picks should be id 0 or 2.
+        for _ in 0..20 {
+            let b = lb.next_backend().unwrap();
+            assert_ne!(b.id, 1);
+        }
     }
 }

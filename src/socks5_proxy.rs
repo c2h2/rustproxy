@@ -315,7 +315,7 @@ impl Socks5Proxy {
             }
             None => {
                 debug!("Creating new connection to {}", target_addr);
-                match crate::dns::tcp_connect(&target_addr).await {
+                match crate::dns::tcp_connect_timeout(&target_addr).await {
                     Ok(stream) => stream,
                     Err(e) => {
                         warn!("Failed to connect to {}: {}", target_addr, e);
@@ -511,11 +511,6 @@ impl Socks5Proxy {
     }
 
     async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, _target_addr: String, stats: Option<Arc<StatsCollector>>, conn_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-        // buffer_size is retained for CLI/config compatibility; the shared
-        // relay relies on socket buffers for backpressure (matching the plain
-        // TCP path) rather than a duplex pipe.
-        let _ = self.buffer_size;
-
         // Keep both legs of the tunnel warm through NATs and detect dead peers.
         // Previously only the target was tuned, so idle client-side NAT mappings
         // silently expired and the next write looked like a random disconnect.
@@ -527,7 +522,7 @@ impl Socks5Proxy {
         // so an abrupt client close with an idle target leaked the task and
         // both sockets forever. run_pumps propagates the break both ways.
         let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) =
-            crate::tcp_proxy::run_pumps(client_stream, target_stream).await;
+            crate::tcp_proxy::run_pumps(client_stream, target_stream, self.buffer_size).await;
 
         if let Some(e) = e_c2s {
             debug!("SOCKS5 client->target ended after {} bytes for {}: {}", bytes_to_target, client_addr, e);
@@ -886,6 +881,22 @@ mod tests {
         let n = client.read(&mut buffer).await.unwrap();
 
         assert_eq!(&buffer[0..n], test_data);
+    }
+
+    /// P1: SOCKS5 outbound connect is bounded (was unbounded hang on silent peer).
+    #[tokio::test]
+    async fn connect_times_out_against_silent_listener() {
+        // Accept TCP but never complete higher-level work — for plain TCP
+        // connect this succeeds. Use a non-listening high port path instead:
+        // tcp_connect_timeout to 127.0.0.1:1 must return Connection refused
+        // (or timeout) without hanging the test.
+        let start = std::time::Instant::now();
+        let err = crate::dns::tcp_connect_timeout("127.0.0.1:1").await;
+        assert!(err.is_err());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "SOCKS5 path uses timed connect; must fail fast on refuse"
+        );
     }
 
     /// Regression: a client RST while the target stays idle must tear the

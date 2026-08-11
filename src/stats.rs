@@ -1,9 +1,9 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::net::SocketAddr;
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
-use tokio::sync::RwLock;
 use tokio::net::UdpSocket;
 use tracing::{debug, error};
 
@@ -38,7 +38,11 @@ pub struct StatsCollector {
     proxy_type: String,
     listen_addr: String,
     connections: Arc<DashMap<String, ConnectionStats>>,
-    total_stats: Arc<RwLock<(u64, u64, u64)>>, // (total_connections, total_sent, total_received)
+    /// Monotonic id counter — avoids `{addr}_{millis}` collisions under concurrent opens.
+    next_id: Arc<AtomicU64>,
+    total_connections: Arc<AtomicU64>,
+    total_bytes_sent: Arc<AtomicU64>,
+    total_bytes_received: Arc<AtomicU64>,
     start_time: u64,
     manager_addr: Option<SocketAddr>,
 }
@@ -56,14 +60,18 @@ impl StatsCollector {
             proxy_type: proxy_type.to_string(),
             listen_addr: listen_addr.to_string(),
             connections: Arc::new(DashMap::new()),
-            total_stats: Arc::new(RwLock::new((0, 0, 0))),
+            next_id: Arc::new(AtomicU64::new(1)),
+            total_connections: Arc::new(AtomicU64::new(0)),
+            total_bytes_sent: Arc::new(AtomicU64::new(0)),
+            total_bytes_received: Arc::new(AtomicU64::new(0)),
             start_time,
             manager_addr,
         }
     }
     
     pub async fn new_connection(&self, client_addr: SocketAddr, target: String) -> String {
-        let conn_id = format!("{}_{}", client_addr, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let conn_id = format!("{}_{}", client_addr, id);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
         let stats = ConnectionStats {
@@ -77,9 +85,7 @@ impl StatsCollector {
         };
         
         self.connections.insert(conn_id.clone(), stats);
-        
-        let mut total = self.total_stats.write().await;
-        total.0 += 1;
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
         
         conn_id
     }
@@ -90,9 +96,8 @@ impl StatsCollector {
             conn.bytes_received += bytes_received;
             conn.last_activity = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
             
-            let mut total = self.total_stats.write().await;
-            total.1 += bytes_sent;
-            total.2 += bytes_received;
+            self.total_bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
+            self.total_bytes_received.fetch_add(bytes_received, Ordering::Relaxed);
         }
     }
     
@@ -104,7 +109,6 @@ impl StatsCollector {
     }
     
     pub async fn get_stats(&self) -> ProxyStats {
-        let total = self.total_stats.read().await;
         let connections: Vec<ConnectionStats> = self.connections
             .iter()
             .map(|entry| entry.value().clone())
@@ -116,10 +120,10 @@ impl StatsCollector {
             proxy_id: self.proxy_id.clone(),
             proxy_type: self.proxy_type.clone(),
             listen_addr: self.listen_addr.clone(),
-            total_connections: total.0,
+            total_connections: self.total_connections.load(Ordering::Relaxed),
             active_connections,
-            total_bytes_sent: total.1,
-            total_bytes_received: total.2,
+            total_bytes_sent: self.total_bytes_sent.load(Ordering::Relaxed),
+            total_bytes_received: self.total_bytes_received.load(Ordering::Relaxed),
             connections,
             start_time: self.start_time,
             last_report: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
@@ -141,6 +145,10 @@ impl StatsCollector {
                 
                 loop {
                     interval.tick().await;
+
+                    // Drop closed connections older than 60s so the map cannot
+                    // grow without bound under high churn.
+                    self.cleanup_inactive(60).await;
                     
                     let stats = self.get_stats().await;
                     let json = match serde_json::to_string(&stats) {
@@ -159,12 +167,17 @@ impl StatsCollector {
         }
     }
     
+    /// Remove inactive connections whose last_activity is at least
+    /// `timeout_secs` in the past (`>=`, so timeout 0 clears all inactive).
     pub async fn cleanup_inactive(&self, timeout_secs: u64) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
         let to_remove: Vec<String> = self.connections
             .iter()
-            .filter(|entry| !entry.value().active && (now - entry.value().last_activity) > timeout_secs)
+            .filter(|entry| {
+                !entry.value().active
+                    && now.saturating_sub(entry.value().last_activity) >= timeout_secs
+            })
             .map(|entry| entry.key().clone())
             .collect();
         
@@ -189,15 +202,10 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
-    /// Characterization: closed connections stay in the map until
-    /// `cleanup_inactive` is called. The proxy reporting loop never
-    /// calls it, so with `--manager-addr` the map grows without bound
-    /// (modulo the conn_id collision bug covered below).
     #[tokio::test]
     async fn closed_connections_accumulate_until_cleanup() {
         let stats = StatsCollector::new("tcp", "127.0.0.1:9", None);
 
-        // Distinct client ports so millis-based ids cannot collide.
         let id1 = stats.new_connection(addr_on_port(10001), "t1".into()).await;
         let id2 = stats.new_connection(addr_on_port(10002), "t2".into()).await;
         assert_ne!(id1, id2);
@@ -206,23 +214,18 @@ mod tests {
 
         assert_eq!(stats.connections.len(), 2, "close must not remove entries");
 
-        // cleanup with huge timeout keeps them (not old enough).
         stats.cleanup_inactive(u64::MAX).await;
         assert_eq!(stats.connections.len(), 2);
 
-        // Predicate is `(now - last_activity) > timeout_secs` (strict), so
-        // same-second closes are NOT removed by timeout=0. Sleep past the
-        // second boundary, then clean.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // timeout_secs=0 with `>=` removes all inactive immediately.
         stats.cleanup_inactive(0).await;
         assert_eq!(
             stats.connections.len(),
             0,
-            "cleanup_inactive(0) must drop inactive entries older than this second"
+            "cleanup_inactive(0) must drop all inactive entries"
         );
     }
 
-    /// Active connections are never cleaned even with timeout 0.
     #[tokio::test]
     async fn cleanup_inactive_preserves_active() {
         let stats = StatsCollector::new("tcp", "127.0.0.1:9", None);
@@ -231,15 +234,9 @@ mod tests {
         assert_eq!(stats.connections.len(), 1);
     }
 
-    /// `conn_id = "{client_addr}_{millis}"` is not unique under concurrent
-    /// accepts from the same peer address within the same millisecond.
-    /// DashMap insert then overwrites, so the map under-counts and
-    /// `total_connections` can disagree with retained rows.
-    ///
-    /// This is a real stats-correctness / memory-accounting bug on busy
-    /// proxies (many short conns from one IP, or same src port reuse).
+    /// P0 fix: concurrent opens from the same peer must retain unique rows.
     #[tokio::test]
-    async fn connection_ids_collide_for_same_client_same_millis() {
+    async fn concurrent_same_peer_all_ids_unique() {
         let stats = Arc::new(StatsCollector::new("tcp", "127.0.0.1:9", None));
         let peer = addr_on_port(44321);
         let mut handles = Vec::new();
@@ -254,26 +251,16 @@ mod tests {
             ids.push(h.await.unwrap());
         }
         let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
-        // If this starts passing with unique==40, the id scheme was fixed.
-        assert!(
-            unique.len() < ids.len(),
-            "expected millis-based conn_id collisions for same peer; got {} unique of {}",
+        assert_eq!(
             unique.len(),
-            ids.len()
+            ids.len(),
+            "conn_ids must be unique under concurrent same-peer opens"
         );
-        // Map cannot hold more entries than unique ids.
-        assert_eq!(stats.connections.len(), unique.len());
-        // total_connections still increments once per call (write-locked).
+        assert_eq!(stats.connections.len(), 40);
         let snap = stats.get_stats().await;
         assert_eq!(snap.total_connections, 40);
-        assert!(
-            snap.connections.len() < 40,
-            "colliding inserts must leave fewer retained connection rows than opens"
-        );
     }
 
-    /// With distinct peers, concurrent opens all land in the map and the
-    /// totals write-lock path still counts correctly.
     #[tokio::test]
     async fn concurrent_new_connection_unique_peers_all_retained() {
         let stats = Arc::new(StatsCollector::new("tcp", "127.0.0.1:9", None));

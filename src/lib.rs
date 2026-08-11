@@ -12,6 +12,7 @@ pub mod healthcheck;
 pub mod traffic_log;
 pub mod conn_tracker;
 pub mod update;
+pub mod tcp_tune;
 
 #[cfg(test)]
 pub mod test_utils;

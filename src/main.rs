@@ -18,6 +18,7 @@ mod healthcheck;
 mod traffic_log;
 mod conn_tracker;
 mod update;
+mod tcp_tune;
 
 #[cfg(test)]
 mod test_utils;
@@ -65,9 +66,8 @@ fn print_usage() {
     println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
     println!("  --traffic-log <path>         CSV file for persistent traffic history (default: ./rustproxy_traffic.csv)");
-    println!("  --buffer-size <size>          Server→client relay buffer (default: 16mb)");
-    println!("                               Decouples fast server reads from slow client writes");
-    println!("                               Examples: 256kb, 16mb, 64mb");
+    println!("  --buffer-size <size>          Per-direction pump read buffer (default: 256kb,");
+    println!("                               clamped 8kb–4mb). Examples: 64kb, 256kb, 1mb");
     println!("  --dns <servers>              Custom DNS resolvers (overrides system DNS).");
     println!("                               Comma-separated list. Each entry may be:");
     println!("                                 8.8.8.8                       (UDP, port 53)");
@@ -89,6 +89,15 @@ fn print_usage() {
     println!("                               or 'socks5' (full SOCKS5 handshake + HTTP GET).");
     println!("                               Default: socks5 when SS/VMess listeners are set,");
     println!("                               tcp otherwise");
+    println!("  --tcp-keepalive-time <secs>  TCP keepalive idle before first probe (default: 120)");
+    println!("  --tcp-keepalive-interval <s> Keepalive probe interval (default: 30)");
+    println!("  --tcp-keepalive-retries <n>  Unanswered probes before drop (default: 3)");
+    println!("  --tcp-user-timeout <secs>    Linux TCP_USER_TIMEOUT; 0 disables (default: 0=off)");
+    println!("  --tcp-sndbuf <size>          SO_SNDBUF (default: 4mb)");
+    println!("  --tcp-rcvbuf <size>          SO_RCVBUF (default: 4mb)");
+    println!();
+    println!("Admin disable API: POST /api/backends/:id/disable  (drain)");
+    println!("                   POST /api/backends/:id/disable?kill=1  (abort in-flight)");
     println!();
     println!("Examples:");
     println!("  rustproxy --manager");
@@ -229,6 +238,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vmess_password = None;
     let mut dns_spec: Option<String> = None;
     let mut dns_cache_size: usize = dns::DEFAULT_CACHE_SIZE;
+    let mut tcp_ka_time: Option<u64> = None;
+    let mut tcp_ka_interval: Option<u64> = None;
+    let mut tcp_ka_retries: Option<u32> = None;
+    let mut tcp_user_timeout: Option<u64> = None; // Some(0) = disable
+    let mut tcp_sndbuf: Option<usize> = None;
+    let mut tcp_rcvbuf: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -387,12 +402,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
+            "--tcp-keepalive-time" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) => tcp_ka_time = Some(n),
+                        Err(_) => {
+                            eprintln!("Invalid --tcp-keepalive-time: {}", args[i + 1]);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--tcp-keepalive-interval" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) => tcp_ka_interval = Some(n),
+                        Err(_) => {
+                            eprintln!("Invalid --tcp-keepalive-interval: {}", args[i + 1]);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--tcp-keepalive-retries" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u32>() {
+                        Ok(n) => tcp_ka_retries = Some(n),
+                        Err(_) => {
+                            eprintln!("Invalid --tcp-keepalive-retries: {}", args[i + 1]);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--tcp-user-timeout" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) => tcp_user_timeout = Some(n),
+                        Err(_) => {
+                            eprintln!("Invalid --tcp-user-timeout: {}", args[i + 1]);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--tcp-sndbuf" => {
+                if i + 1 < args.len() {
+                    match parse_cache_size(&args[i + 1]) {
+                        Ok(n) => tcp_sndbuf = Some(n),
+                        Err(e) => {
+                            eprintln!("Invalid --tcp-sndbuf: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--tcp-rcvbuf" => {
+                if i + 1 < args.len() {
+                    match parse_cache_size(&args[i + 1]) {
+                        Ok(n) => tcp_rcvbuf = Some(n),
+                        Err(e) => {
+                            eprintln!("Invalid --tcp-rcvbuf: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 print_usage();
                 std::process::exit(1);
             }
         }
+    }
+
+    // Install process-wide TCP tuning before any listeners start.
+    // Defaults: keepalive 120/30/3, user-timeout off, snd/rcvbuf 4mb.
+    {
+        let mut cfg = tcp_tune::TcpTuneConfig::default();
+        if let Some(n) = tcp_ka_time {
+            cfg.keepalive_time = std::time::Duration::from_secs(n);
+        }
+        if let Some(n) = tcp_ka_interval {
+            cfg.keepalive_interval = std::time::Duration::from_secs(n);
+        }
+        if let Some(n) = tcp_ka_retries {
+            cfg.keepalive_retries = n;
+        }
+        if let Some(n) = tcp_user_timeout {
+            cfg.user_timeout = if n == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(n))
+            };
+        }
+        // CLI overrides only when explicitly passed; otherwise keep 4mb defaults.
+        if let Some(n) = tcp_sndbuf {
+            cfg.sndbuf = Some(n);
+        }
+        if let Some(n) = tcp_rcvbuf {
+            cfg.rcvbuf = Some(n);
+        }
+        let _ = tcp_tune::set_tcp_tune(cfg);
+        info!(
+            "TCP tune: keepalive {}s/{}s×{}, user_timeout={:?}, sndbuf={:?}, rcvbuf={:?}",
+            tcp_tune::tcp_tune().keepalive_time.as_secs(),
+            tcp_tune::tcp_tune().keepalive_interval.as_secs(),
+            tcp_tune::tcp_tune().keepalive_retries,
+            tcp_tune::tcp_tune().user_timeout.map(|d| d.as_secs()),
+            tcp_tune::tcp_tune().sndbuf,
+            tcp_tune::tcp_tune().rcvbuf,
+        );
     }
 
     if let Some(ref spec) = dns_spec {
