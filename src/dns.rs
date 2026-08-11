@@ -165,17 +165,29 @@ pub async fn resolve(addr: &str) -> io::Result<SocketAddr> {
             .lookup_ip(host)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("dns: {}", e)))?;
-        let ip = lookup.iter().next().ok_or_else(|| {
+        // First record only — no Happy Eyeballs / multi-IP retry.
+        let ip = first_ip(lookup.iter()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("no records for {}", host))
         })?;
         return Ok(SocketAddr::new(ip, port));
     }
 
-    // System fallback
-    tokio::net::lookup_host(addr)
-        .await?
-        .next()
+    // System fallback — also first address only.
+    first_socket_addr(tokio::net::lookup_host(addr).await?)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {}", addr)))
+}
+
+/// Pick the first IP from a resolver result. Exposed for characterization
+/// tests: the proxy never tries later addresses if the first is unreachable.
+pub(crate) fn first_ip(mut ips: impl Iterator<Item = IpAddr>) -> Option<IpAddr> {
+    ips.next()
+}
+
+/// Pick the first `SocketAddr` from a lookup iterator.
+pub(crate) fn first_socket_addr(
+    mut addrs: impl Iterator<Item = SocketAddr>,
+) -> Option<SocketAddr> {
+    addrs.next()
 }
 
 fn parse_host_port(addr: &str) -> io::Result<(&str, u16)> {
@@ -294,6 +306,23 @@ mod tests {
         // 0 cache size disables caching but is allowed; values over MAX_CACHE_SIZE rejected.
         let err = init_from_spec("1.1.1.1", MAX_CACHE_SIZE + 1).unwrap_err();
         assert!(err.contains("exceeds maximum"), "got: {}", err);
+    }
+
+    /// Characterization: when multiple IPs are available, only the first is
+    /// used — no Happy Eyeballs / failover. A dead first A/AAAA therefore
+    /// fails the connect even if a later address would work.
+    #[test]
+    fn resolve_selects_only_the_first_ip() {
+        let a: IpAddr = "1.1.1.1".parse().unwrap();
+        let b: IpAddr = "8.8.8.8".parse().unwrap();
+        let c: IpAddr = "9.9.9.9".parse().unwrap();
+        assert_eq!(first_ip([a, b, c].into_iter()), Some(a));
+        assert_eq!(first_ip(std::iter::empty()), None);
+
+        let sa1 = SocketAddr::new(a, 443);
+        let sa2 = SocketAddr::new(b, 443);
+        assert_eq!(first_socket_addr([sa1, sa2].into_iter()), Some(sa1));
+        assert_eq!(first_socket_addr(std::iter::empty()), None);
     }
 
     #[tokio::test]

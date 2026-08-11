@@ -478,4 +478,33 @@ mod tests {
         assert!(!b.enabled.load(Ordering::Relaxed));
         assert_eq!(b.stats.hc_status.load(Ordering::Relaxed), 4);
     }
+
+    /// Contrast pair for disconnect review:
+    /// health disable drains (no kill); a later admin `kill_active` does kill.
+    #[tokio::test]
+    async fn health_drain_then_admin_kill_wakes_waiters() {
+        let b = Arc::new(test_backend());
+        let waiter = {
+            let b = b.clone();
+            tokio::spawn(async move { b.wait_kill().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for _ in 0..FAIL_THRESHOLD {
+            apply_health_result(&b, 0, "test", HealthCheckResult::Timeout);
+        }
+        assert!(!b.enabled.load(Ordering::Relaxed));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "health disable must not wake wait_kill"
+        );
+
+        b.kill_active();
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("admin kill_active must wake wait_kill")
+            .unwrap();
+    }
 }

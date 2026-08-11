@@ -17,6 +17,7 @@ mod web;
 mod healthcheck;
 mod traffic_log;
 mod conn_tracker;
+mod update;
 
 #[cfg(test)]
 mod test_utils;
@@ -32,6 +33,14 @@ fn print_usage() {
     println!("Usage:");
     println!("  rustproxy --manager [--listen <address:port>]");
     println!("  rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5|ss> [options]");
+    println!("  rustproxy --update");
+    println!("  rustproxy --version");
+    println!();
+    println!("Self-update:");
+    println!("  --update                     Always re-download the latest GitHub release");
+    println!("                               binary for this platform from");
+    println!("                               https://github.com/c2h2/rustproxy and replace");
+    println!("                               the running executable in place");
     println!();
     println!("Manager Mode:");
     println!("  --manager                    Start in manager mode (default: 127.0.0.1:13337)");
@@ -148,6 +157,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("rustproxy {}", build_version());
         return Ok(());
+    }
+
+    // Self-update from GitHub releases (always re-downloads latest).
+    // Handled before tracing/fd limits so output stays readable and no
+    // proxy sockets are opened.
+    if args.iter().any(|a| a == "--update") {
+        match update::run_update() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("rustproxy --update failed: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     tracing_subscriber::fmt::init();

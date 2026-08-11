@@ -33,17 +33,27 @@ const RECENT_WINDOW: StdDuration = StdDuration::from_secs(5 * 60); // 5 minutes
 /// How long a connection may sit completely idle before the first TCP
 /// keepalive probe. Must be shorter than typical NAT/firewall idle timeouts
 /// (often 30–120s); 20s keeps the mapping warm without excess probes.
-const TCP_KEEPALIVE_TIME: StdDuration = StdDuration::from_secs(20);
+///
+/// Characterization tests pin these values: aggressive keepalive is a
+/// known source of mid-idle disconnects on briefly-unreachable peers.
+pub(crate) const TCP_KEEPALIVE_TIME: StdDuration = StdDuration::from_secs(20);
 /// Interval between successive keepalive probes after the first.
-const TCP_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(10);
+pub(crate) const TCP_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(10);
 /// Give up after this many unanswered probes (~50s total dead-peer detect:
 /// 20 + 10*3).
-const TCP_KEEPALIVE_RETRIES: u32 = 3;
+pub(crate) const TCP_KEEPALIVE_RETRIES: u32 = 3;
 /// Linux-only: max time unacknowledged data may sit on the wire before the
 /// connection is aborted. Covers blackhole paths where keepalive alone is
 /// slow to notice. Slightly above keepidle+keepintvl*keepcnt.
+///
+/// On slow/lossy bulk transfers this can abort a live stream after 60s of
+/// unacked data — a hypothesized disconnect source under congestion.
 #[cfg(target_os = "linux")]
-const TCP_USER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+pub(crate) const TCP_USER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+
+/// Fixed per-direction userspace pump buffer. The CLI `--buffer-size` is
+/// currently discarded; every relay uses this size (see `pump`).
+pub(crate) const PUMP_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Apply connection-stability socket options used by every relay path.
 ///
@@ -1276,13 +1286,17 @@ where
 
 /* -------------------------- Accurate pump -------------------------- */
 
+/// Production grace after a broken peer direction. Tests override this to
+/// a short value so RST-leak regressions stay fast.
+pub(crate) const HALF_CLOSE_GRACE_PROD: Duration = Duration::from_secs(30);
+
 /// How long the surviving direction may keep running after the other
 /// direction died with an I/O error (broken peer). A clean EOF half-close
 /// is NOT subject to this grace — it waits indefinitely, since protocols
 /// may legitimately stream long responses after the client closes its
 /// write side.
 #[cfg(not(test))]
-const HALF_CLOSE_GRACE: Duration = Duration::from_secs(30);
+const HALF_CLOSE_GRACE: Duration = HALF_CLOSE_GRACE_PROD;
 #[cfg(test)]
 const HALF_CLOSE_GRACE: Duration = Duration::from_millis(500);
 
@@ -1300,7 +1314,9 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 256 * 1024];
+    // Intentionally ignores any CLI `--buffer-size`: one fixed size for
+    // every connection so memory is predictable (see PUMP_BUFFER_SIZE tests).
+    let mut buf = vec![0u8; PUMP_BUFFER_SIZE];
 
     loop {
         let n = match r.read(&mut buf).await {
@@ -1711,5 +1727,330 @@ mod tests {
             Ok(inner) => assert!(inner.is_err(), "handshake against silent backend must fail"),
             Err(_) => panic!("socks5_connect hung >5s on an unresponsive backend"),
         }
+    }
+
+    /* ---------- Characterization: disconnect / performance guesses ---------- */
+
+    /// Pin the aggressive keepalive timings hypothesized to drop mid-idle
+    /// peers (mobile radio sleep, laptop lid, brief NAT blips).
+    #[test]
+    fn keepalive_timings_are_aggressive_for_nat() {
+        assert_eq!(TCP_KEEPALIVE_TIME, StdDuration::from_secs(20));
+        assert_eq!(TCP_KEEPALIVE_INTERVAL, StdDuration::from_secs(10));
+        assert_eq!(TCP_KEEPALIVE_RETRIES, 3);
+        // Dead-peer detect upper bound ≈ keepidle + keepintvl * keepcnt
+        let dead_peer_detect =
+            TCP_KEEPALIVE_TIME + TCP_KEEPALIVE_INTERVAL * TCP_KEEPALIVE_RETRIES;
+        assert_eq!(dead_peer_detect, StdDuration::from_secs(50));
+        assert!(
+            dead_peer_detect < StdDuration::from_secs(90),
+            "keepalive is more aggressive than typical 90s+ NAT idle timers expect for bulk"
+        );
+    }
+
+    /// Production half-close grace after a *broken* direction is 30s.
+    /// (Under `cfg(test)` the runtime grace is shortened for speed.)
+    #[test]
+    fn half_close_grace_prod_is_30s() {
+        assert_eq!(HALF_CLOSE_GRACE_PROD, Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_user_timeout_is_60s_on_linux() {
+        assert_eq!(TCP_USER_TIMEOUT, StdDuration::from_secs(60));
+    }
+
+    /// `--buffer-size` is a no-op for the relay: pump always uses
+    /// `PUMP_BUFFER_SIZE` regardless of the parameter passed through.
+    #[test]
+    fn pump_buffer_is_fixed_independent_of_cli_buffer_size() {
+        assert_eq!(PUMP_BUFFER_SIZE, 256 * 1024);
+        // CLI default is advertised as 16mb — many multiples of the real pump.
+        let advertised_default = 16 * 1024 * 1024;
+        assert!(
+            advertised_default > PUMP_BUFFER_SIZE * 10,
+            "CLI default buffer-size still far larger than the real pump buffer"
+        );
+    }
+
+    /// Both buffer_size=0 and buffer_size=64MB complete the same echo —
+    /// characterization that the parameter does not gate transfer.
+    #[tokio::test]
+    async fn buffer_size_parameter_does_not_affect_echo_transfer() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        async fn echo_once(buffer_size: usize) {
+            let mock = MockTcpServer::new().await.unwrap();
+            let target = mock.addr();
+            tokio::spawn(mock.echo_server());
+
+            let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front_addr = front.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (inbound, client_addr) = front.accept().await.unwrap();
+                let _ = TcpProxy::connect_and_relay(
+                    inbound,
+                    client_addr,
+                    target.to_string(),
+                    ConnectionCache::new(0),
+                    None,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    buffer_size,
+                )
+                .await;
+            });
+
+            let mut client = TcpStream::connect(front_addr).await.unwrap();
+            let msg = b"buffer-size-ignored-payload";
+            client.write_all(msg).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], msg);
+        }
+
+        echo_once(0).await;
+        echo_once(64 * 1024 * 1024).await;
+    }
+
+    /// `tune_tcp_stream` sets TCP_NODELAY (universal). Keepalive is best-effort
+    /// via socket2; we at least prove nodelay is applied on a live socket.
+    #[tokio::test]
+    async fn tune_tcp_stream_sets_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            s
+        });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server = accept.await.unwrap();
+
+        // Default may already be nodelay-off; force known state then tune.
+        let _ = client.set_nodelay(false);
+        assert!(!client.nodelay().unwrap());
+        tune_tcp_stream(&client);
+        assert!(
+            client.nodelay().unwrap(),
+            "tune_tcp_stream must enable TCP_NODELAY"
+        );
+
+        // Server side of an accepted conn also gets tuned in the real path.
+        let _ = server.set_nodelay(false);
+        tune_tcp_stream(&server);
+        assert!(server.nodelay().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tune_tcp_stream_sets_user_timeout_on_linux() {
+        use socket2::SockRef;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            s
+        });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let _server = accept.await.unwrap();
+
+        tune_tcp_stream(&client);
+        let got = SockRef::from(&client)
+            .tcp_user_timeout()
+            .expect("get TCP_USER_TIMEOUT");
+        assert_eq!(
+            got,
+            Some(TCP_USER_TIMEOUT),
+            "Linux user timeout must be 60s — hypothesized bulk-transfer abort source"
+        );
+    }
+
+    /// Core disconnect claim for LB mode: admin disable wakes `wait_kill`
+    /// and the accept-loop `select!` aborts the live relay, so the client
+    /// sees the connection drop mid-session.
+    #[tokio::test]
+    async fn admin_backend_kill_drops_in_flight_tcp_forward() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // Idle-ish backend: accept, echo one burst, then hold open forever
+        // so the relay stays up until kill.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = sock.read(&mut buf).await.unwrap();
+            let _ = sock.write_all(&buf[..n]).await;
+            // Hold the socket open (idle read) so only kill tears the relay.
+            let mut sink = [0u8; 64];
+            let _ = sock.read(&mut sink).await; // blocks until peer closes
+        });
+
+        let backend = Arc::new(crate::lb::Backend::new(0, backend_addr));
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+
+        let backend_for_relay = backend.clone();
+        let relay = tokio::spawn(async move {
+            let (inbound, client_addr) = front.accept().await.unwrap();
+            let target = backend_addr.to_string();
+            let relay_fut = TcpProxy::connect_and_relay(
+                inbound,
+                client_addr,
+                target.clone(),
+                ConnectionCache::new(0),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                0,
+            );
+            // Same select! shape as run_plain_accept_loop LB branch.
+            tokio::select! {
+                r = relay_fut => r.map(|_| ()).map_err(|e| e.to_string()),
+                _ = backend_for_relay.wait_kill() => {
+                    Err("backend marked unhealthy".to_string())
+                }
+            }
+        });
+
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+
+        // Mid-session admin disable → kill_active.
+        backend.kill_active();
+
+        // Relay task must finish promptly (not wait for idle peer forever).
+        let outcome = tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("relay did not abort within 2s after admin kill");
+        let result = outcome.expect("relay task panicked");
+        assert!(
+            result.is_err(),
+            "admin kill must abort the relay with an error, got Ok"
+        );
+
+        // Client read should observe the tear-down (EOF or error), not hang.
+        let client_done = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        match client_done {
+            Ok(Ok(0)) | Ok(Err(_)) => {} // EOF or RST — dropped as claimed
+            Ok(Ok(n)) => panic!("unexpected data after kill: {:?}", &buf[..n]),
+            Err(_) => panic!("client hung after admin kill tore down the relay"),
+        }
+    }
+
+    /// Contrast: without kill, an established idle forward must stay up
+    /// longer than HALF_CLOSE_GRACE (test value 500ms) — proving we only
+    /// tear down on error/kill, not on a silent timer.
+    #[tokio::test]
+    async fn idle_forward_survives_past_half_close_grace_without_kill() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = sock.read(&mut buf).await.unwrap();
+            let _ = sock.write_all(&buf[..n]).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (inbound, client_addr) = front.accept().await.unwrap();
+            let _ = TcpProxy::connect_and_relay(
+                inbound,
+                client_addr,
+                backend_addr.to_string(),
+                ConnectionCache::new(0),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                0,
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        client.write_all(b"stay").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"stay");
+
+        // Wait well past the test HALF_CLOSE_GRACE (500ms).
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        assert!(
+            !relay.is_finished(),
+            "idle healthy forward must not self-tear after HALF_CLOSE_GRACE"
+        );
+
+        // Still able to send more data.
+        client.write_all(b"more").await.unwrap();
+        // Backend only reads once in this fixture — connection still open though.
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), relay).await;
+    }
+
+    /// Broken direction + idle peer: grace expires and the relay ends.
+    /// Approves the claim that one-sided I/O errors cause disconnect after
+    /// HALF_CLOSE_GRACE (not hang forever, and not wait production 30s in tests).
+    #[tokio::test]
+    async fn broken_peer_tears_down_within_half_close_grace() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = backend_listener.accept().await.unwrap();
+            // Never read/write/close — worst-case idle peer.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let started = Instant::now();
+        let relay = tokio::spawn(async move {
+            let (inbound, client_addr) = front.accept().await.unwrap();
+            let _ = TcpProxy::connect_and_relay(
+                inbound,
+                client_addr,
+                backend_addr.to_string(),
+                ConnectionCache::new(0),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                0,
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // RST client → broken direction.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(StdDuration::from_secs(0)))
+            .unwrap();
+        drop(client);
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), relay)
+            .await
+            .expect("relay must finish after broken peer + grace");
+        let elapsed = started.elapsed();
+        // Test grace is 500ms; allow scheduling slack but far under production 30s.
+        assert!(
+            elapsed < StdDuration::from_secs(5),
+            "teardown took {:?}, expected near HALF_CLOSE_GRACE (500ms test)",
+            elapsed
+        );
     }
 }

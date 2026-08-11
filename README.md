@@ -42,6 +42,16 @@ curl -fsSL https://raw.githubusercontent.com/c2h2/rustproxy/master/scripts/insta
 
 Supported targets: `linux-amd64`, `linux-arm64` (musl, static), `macos-arm64`.
 
+### Self-update
+
+Re-download the latest GitHub release for this platform and replace the
+running binary in place (always downloads — never skips):
+
+```bash
+rustproxy --update
+rustproxy --version
+```
+
 ### Build from source
 
 Make sure you have Rust installed, then build the project:
