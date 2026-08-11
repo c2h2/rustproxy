@@ -71,9 +71,30 @@ rustproxy --bench --size 512
 rustproxy --bench --modes tcp,socks5,ss --size 128 --warmup 1
 ```
 
-MB/s is decimal megabytes/sec. Loopback is noisy and is an **upper bound**,
-not a WAN estimate. On a quiet Apple Silicon host, single-stream TCP forward
-is often multi‑GB/s (see your local `--bench` table).
+MB/s is **decimal megabytes/sec** (`bytes / 1e6 / seconds`). Loopback is noisy
+and is an **upper bound**, not a WAN/NIC estimate — run `--bench` on your own
+machine for comparable numbers.
+
+#### Sample results (v2.1.1)
+
+| | |
+|--|--|
+| **Host** | Apple M3 Pro, 12 cores, macOS, arm64 |
+| **Build** | `rustproxy 2.1.1` release |
+| **Command** | `rustproxy --bench --size 256 --warmup 1` |
+| **Payload** | 256 MiB upload + 256 MiB download, single stream, `127.0.0.1` |
+
+| mode | upload MB/s | download MB/s | notes |
+|------|------------:|--------------:|-------|
+| **direct** | 8654 | 11896 | no proxy (baseline) |
+| **tcp** | 9647 | 5422 | plain TCP forward |
+| **socks5** | 10258 | 5535 | SOCKS5 CONNECT |
+| **http** | 10073 | 5476 | HTTP `CONNECT` tunnel |
+| **ss** | 2002 | 2407 | Shadowsocks AES-256-GCM |
+
+Rough Gbps (×8): plain proxy modes ~**40–80+ Gbps** on loopback; SS
+AES-256-GCM ~**16–19 Gbps** (crypto-bound). Absolute numbers vary run-to-run;
+relative ranking (plain ≫ SS) is stable.
 
 ### Build from source
 
