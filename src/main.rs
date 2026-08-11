@@ -19,6 +19,7 @@ mod traffic_log;
 mod conn_tracker;
 mod update;
 mod tcp_tune;
+mod bench;
 
 #[cfg(test)]
 mod test_utils;
@@ -35,6 +36,7 @@ fn print_usage() {
     println!("  rustproxy --manager [--listen <address:port>]");
     println!("  rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5|ss> [options]");
     println!("  rustproxy --update");
+    println!("  rustproxy --bench [--size MiB] [--modes list]");
     println!("  rustproxy --version");
     println!();
     println!("Self-update:");
@@ -42,6 +44,12 @@ fn print_usage() {
     println!("                               binary for this platform from");
     println!("                               https://github.com/c2h2/rustproxy and replace");
     println!("                               the running executable in place");
+    println!();
+    println!("Self-bench (localhost loopback):");
+    println!("  --bench                      Throughput test: direct + tcp + socks5 + http");
+    println!("  --size <MiB>                 Payload per direction (default: 256)");
+    println!("  --modes direct,tcp,socks5,http   Subset of modes (default: all)");
+    println!("  --warmup <N>                 Discarded warm-up runs (default: 1)");
     println!();
     println!("Manager Mode:");
     println!("  --manager                    Start in manager mode (default: 127.0.0.1:13337)");
@@ -176,6 +184,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 eprintln!("rustproxy --update failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Localhost loopback throughput suite (before noisy tracing if possible).
+    if args.iter().any(|a| a == "--bench") {
+        // Minimal logging so the table stays readable.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .try_init();
+        match bench::run_bench(&args).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("rustproxy --bench failed: {}", e);
                 std::process::exit(1);
             }
         }

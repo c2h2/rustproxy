@@ -1,26 +1,26 @@
 # RustProxy
 
-A high-performance proxy server written in Rust with configurable connection caching and real-time web dashboard.
+A high-performance proxy server written in Rust with load balancing, Shadowsocks/VMess listeners, and a real-time web dashboard.
 
 ![Dashboard Screenshot](docs/screenshot.png)
 
 ## Motivation
 
-This project was inspired by the limitations of HAProxy + SOCKS load balancing setups, which proved to be unstable in production environments. Existing solutions lacked robust performance caching and strong backend disable mechanisms. RustProxy was vibe-coded to address these pain points with a focus on stability, performance, and operational visibility.
+This project was inspired by the limitations of HAProxy + SOCKS load balancing setups, which proved to be unstable in production environments. Existing solutions lacked strong backend disable mechanisms and operational visibility. RustProxy focuses on stability, throughput, and day-2 ops (dashboard, healthchecks, self-update, self-bench).
 
 ## Features
 
-- **TCP Proxy**: Forward TCP connections to target servers
-- **TCP Load Balancing**: Distribute connections across multiple backends with round-robin or random algorithms
-- **Shadowsocks Server**: Accept encrypted SS client connections with AEAD ciphers (standalone or combined with TCP LB)
-- **HTTP Proxy**: Forward HTTP requests to target servers
-- **SOCKS5 Proxy**: Full SOCKS5 server with optional authentication
-- **Connection Caching**: Configurable connection pooling to improve performance
-- **Web Dashboard**: Built-in HAProxy-style dashboard for load balancer monitoring and control
-- **Healthcheck**: Automatic backend health probing with disable/re-enable logic
-- **REST API**: Enable/disable backends at runtime via HTTP API
-- **Async/Await**: Built with Tokio for high-performance async networking
-- **Flexible Configuration**: Command-line configuration with sensible defaults
+- **TCP Proxy**: High-speed byte-forwarding to a target (or LB backends)
+- **TCP Load Balancing**: Round-robin or random across multiple backends; admin drain/kill
+- **Shadowsocks Server**: AEAD ciphers (standalone or combined with TCP LB)
+- **VMess listener**: AEAD mode on a separate port (TCP LB path)
+- **HTTP Proxy**: Forward proxy + HTTPS `CONNECT` tunnels
+- **SOCKS5 Proxy**: CONNECT + UDP ASSOCIATE, optional user/pass auth
+- **Web Dashboard**: LB stats, enable/disable backends, traffic history
+- **Healthcheck**: TCP or SOCKS5 probes; disable after consecutive failures (drain, no kill)
+- **Self-update**: `rustproxy --update` from GitHub releases
+- **Self-bench**: `rustproxy --bench` localhost loopback throughput (direct/tcp/socks5/http)
+- **DNS**: Custom UDP/TCP/DoT/DoH resolvers with multi-IP connect fallback
 
 ## Installation
 
@@ -52,6 +52,28 @@ rustproxy --update
 rustproxy --version
 ```
 
+### Self-bench (localhost loopback)
+
+Built-in throughput test. Spins up an in-process sink/source server and
+measures **upload + download** through each mode on `127.0.0.1`:
+
+| mode | what is measured |
+|------|------------------|
+| `direct` | client → backend (no proxy baseline) |
+| `tcp` | client → TCP forward proxy → backend |
+| `socks5` | client → SOCKS5 CONNECT → backend |
+| `http` | client → HTTP `CONNECT` tunnel → backend |
+
+```bash
+rustproxy --bench
+rustproxy --bench --size 512
+rustproxy --bench --modes tcp,socks5 --size 128 --warmup 1
+```
+
+MB/s is decimal megabytes/sec. Loopback is noisy and is an **upper bound**,
+not a WAN estimate. On a quiet Apple Silicon host, single-stream TCP forward
+is often multi‑GB/s (see your local `--bench` table).
+
 ### Build from source
 
 Make sure you have Rust installed, then build the project:
@@ -64,6 +86,8 @@ cargo build --release
 
 ```bash
 rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|socks5|ss> [options]
+rustproxy --bench [--size MiB] [--modes direct,tcp,socks5,http]
+rustproxy --update
 ```
 
 ### Options
@@ -71,16 +95,21 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
 - `--listen <address:port>` - Address to listen on
 - `--target <address:port>` - Address to proxy requests to (required for tcp mode). Comma-separated for load balancing
 - `--mode <tcp|http|socks5|ss>` - Proxy mode
-- `--cache-size <size>` - Connection cache size (default: 64MB)
-  - Examples: `0`, `none`, `256kb`, `1mb`, `8mb`
-- `--buffer-size <size>` - Server-to-client relay buffer (default: 16MB)
+- `--cache-size <size>` - Legacy CLI size (outbound stream pooling is **disabled** by design; kept for compatibility). Examples: `0`, `256kb`, `1mb`
+- `--buffer-size <size>` - Per-direction pump read buffer (default **256kb**, clamped 8kb–4mb)
+- `--tcp-keepalive-time <secs>` - Keepalive idle before first probe (default **120**)
+- `--tcp-keepalive-interval <secs>` - Keepalive probe interval (default **30**)
+- `--tcp-keepalive-retries <n>` - Unanswered probes before drop (default **3**)
+- `--tcp-user-timeout <secs>` - Linux `TCP_USER_TIMEOUT`; **0** disables (default **0**)
+- `--tcp-sndbuf` / `--tcp-rcvbuf` - `SO_SNDBUF` / `SO_RCVBUF` (default **4mb**)
 - `--socks5-auth <user:pass>` - SOCKS5 authentication credentials (optional)
 - `--ss-password <password>` - Shadowsocks pre-shared key (required for `ss` mode, optional for `tcp` mode)
 - `--ss-method <cipher>` - Shadowsocks cipher (default: `aes-256-gcm`). Supported: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 - `--ss-listen-port <addr:port>` - Separate SS listener port (tcp mode). Plain TCP on `--listen`, SS on this port
 - `--lb <random|roundrobin>` - Load balancing algorithm (tcp mode, requires multiple targets)
 - `--http-interface <addr:port>` - HTTP dashboard for LB monitoring (e.g. `:8888`)
-- `--healthcheck` - Enable HTTP ping healthcheck for TCP LB backends (60s interval)
+- `--healthcheck` - Enable healthcheck for TCP LB backends (60s interval; drain on failure)
+- `--healthcheck-probe <tcp|socks5>` - Probe kind (default: tcp, or socks5 when SS/VMess listeners set)
 - `--traffic-log <path>` - CSV file for persistent traffic history (default: `./rustproxy_traffic.csv`)
 - `--manager-addr <addr:port>` - Manager address for stats reporting
 - `--dns <servers>` - Custom DNS resolvers (overrides system DNS for all outbound lookups). Comma-separated list of one or more upstreams. Each entry may be:
@@ -91,24 +120,25 @@ rustproxy --listen <address:port> [--target <address:port>] --mode <tcp|http|soc
   - `tls://1.1.1.1` — DNS-over-TLS (DoT, port 853 default; bare IPs work with public resolvers like `1.1.1.1`/`8.8.8.8`/`9.9.9.9` whose certs carry IP SANs; hostnames like `tls://dns.google` also accepted)
   - `https://cloudflare-dns.com/dns-query` — DNS-over-HTTPS (DoH; hostname required so the TLS cert validates — bare-IP DoH URLs are rejected)
 
-  Queries retry up to 3 times with a 3s per-try timeout; with multiple upstreams configured, a failing/timing-out server falls through to the next (redundancy).
+  Queries retry up to 3 times with a 3s per-try timeout; connect tries **all** resolved IPs until one accepts.
 - `--dns-cache-size <N>` - Max cached DNS entries when `--dns` is set (default: `16384`, hard cap: `262144`). Entries respect DNS TTL; only useful working-set size is bounded.
+- `--update` - Re-download latest GitHub release binary into place
+- `--bench` - Localhost loopback throughput suite (see above)
+- `--version` / `-V` - Print version and exit
+
+Admin disable API: `POST /api/backends/:id/disable` drains in-flight connections;
+append `?kill=1` to abort them immediately.
 
 ### Examples
 
-**TCP Proxy with default caching (256KB):**
+**TCP Proxy:**
 ```bash
 rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp
 ```
 
-**TCP Proxy with 1MB connection cache:**
+**TCP Proxy with larger pump buffer:**
 ```bash
-rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 1mb
-```
-
-**TCP Proxy with caching disabled:**
-```bash
-rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --cache-size 0
+rustproxy --listen 127.0.0.1:8080 --target 192.168.1.100:9000 --mode tcp --buffer-size 1mb
 ```
 
 **TCP Load Balancer (round-robin across 3 backends):**

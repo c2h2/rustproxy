@@ -13,6 +13,7 @@ pub mod traffic_log;
 pub mod conn_tracker;
 pub mod update;
 pub mod tcp_tune;
+pub mod bench;
 
 #[cfg(test)]
 pub mod test_utils;
