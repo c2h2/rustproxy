@@ -129,7 +129,7 @@ rustproxy --update
 - `--ss-password <password>` - Shadowsocks pre-shared key (required for `ss` mode, optional for `tcp` mode)
 - `--ss-method <cipher>` - Shadowsocks cipher (default: `aes-256-gcm`). Supported: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 - `--ss-listen-port <addr:port>` - Separate SS listener port (tcp mode). Plain TCP on `--listen`, SS on this port
-- `--lb <random|roundrobin>` - Load balancing algorithm (tcp mode, requires multiple targets)
+- `--lb <random|roundrobin|failover>` - Load balancing algorithm (tcp mode, requires multiple targets). `failover` is sticky priority in `--target` order.
 - `--http-interface <addr:port>` - HTTP dashboard for LB monitoring (e.g. `:8888`)
 - `--healthcheck` - Enable healthcheck for TCP LB backends (60s interval; drain on failure)
 - `--healthcheck-probe <tcp|socks5>` - Probe kind (default: tcp, or socks5 when SS/VMess listeners set)
@@ -183,6 +183,14 @@ rustproxy --listen 127.0.0.1:8080 \
 rustproxy --listen 127.0.0.1:8080 \
   --target 10.0.0.1:1080,10.0.0.2:1080,10.0.0.3:1080 \
   --mode tcp --lb roundrobin --http-interface :8888 --healthcheck
+```
+
+**Sticky priority failover (stay on the current backend while it works; on failure go next):**
+```bash
+rustproxy --listen 0.0.0.0:11175 \
+  --target 127.0.0.1:11180,127.0.0.1:11181,127.0.0.1:11190,127.0.0.1:11191 \
+  --mode tcp --lb failover --healthcheck --healthcheck-probe socks5 \
+  --http-interface 0.0.0.0:62075
 ```
 
 **HTTP Proxy (local server, no forwarding):**
@@ -280,7 +288,7 @@ When `--dns` is set, the system resolver is **not** used — every hostname (TCP
 
 - **TCP Proxy** (`src/tcp_proxy.rs`): Handles raw TCP connection forwarding, supports single-target, load-balanced, and SS-encrypted modes
 - **Shadowsocks Proxy** (`src/ss_proxy.rs`): Standalone Shadowsocks server using the `shadowsocks` crate for AEAD decryption
-- **Load Balancer** (`src/lb.rs`): Round-robin and random algorithms, per-backend atomic stats, runtime enable/disable
+- **Load Balancer** (`src/lb.rs`): Round-robin, random, and sticky priority failover, per-backend atomic stats, runtime enable/disable
 - **Healthcheck** (`src/healthcheck.rs`): HTTP ping backend health probing with automatic disable/re-enable
 - **Web Dashboard** (`src/web.rs`): Axum-based HTTP server serving the LB dashboard and REST API
 - **Dashboard UI** (`static/lb_dashboard.html`): HAProxy-style web interface with auto-refresh
@@ -301,8 +309,9 @@ When multiple targets are specified (comma-separated), rustproxy operates in loa
 |-----------|------|-------------|
 | Round Robin | `--lb roundrobin` | Cycles through enabled backends sequentially |
 | Random | `--lb random` | Selects a random enabled backend for each connection |
+| Failover | `--lb failover` | Sticky priority in `--target` order (1,2,3,…). Stay on the current backend while it is healthy; when it fails, walk to the next later target. Never fail back to a recovered higher-priority backend while the current one still works. Wrap to the head only after the tail is exhausted. Pair with `--healthcheck`. Aliases: `priority`, `sticky`. |
 
-If `--lb` is not specified but multiple targets are given, round-robin is used by default.
+If `--lb` is not specified but multiple targets are given, random is used by default.
 
 ### Web Dashboard
 
@@ -361,9 +370,12 @@ When `--healthcheck` is enabled (TCP LB mode only), rustproxy continuously monit
 ### Self-Test
 
 On startup in LB mode, rustproxy performs a non-blocking self-test:
-1. Tries connecting to the proxy listener (5s timeout)
-2. Tries connecting to each backend (3s timeout)
-3. Logs PASS/WARN for each — warnings only, does not block startup
+1. Logs the LB algorithm (and failover priority-1 target)
+2. Tries connecting to the proxy listener (5s timeout)
+3. Tries connecting to each backend in list order (3s timeout), tagged with priority
+4. Logs PASS/WARN for each — warnings only, does not block startup
+
+Unit tests in `src/lb.rs` cover failover stickiness, go-next, no-fail-back, wrap, and all-down.
 
 ## SOCKS5 Features
 

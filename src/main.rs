@@ -72,7 +72,11 @@ fn print_usage() {
     println!("  --vmess-listen-port <addr:port>  VMess listener port (tcp mode, requires --vmess-password)");
     println!("  --vmess-password <uuid-or-string> VMess user UUID (if not a valid UUID, derives via UUID v5)");
     println!("  --manager-addr <addr:port>   Manager address for stats reporting");
-    println!("  --lb <random|roundrobin>     Load balancing algorithm (tcp mode, requires multiple targets)");
+    println!("  --lb <random|roundrobin|failover>  Load balancing algorithm (tcp mode, multiple targets)");
+    println!("                               failover: sticky priority in --target order (1,2,3,…).");
+    println!("                               Stay on the current backend while it works; on failure");
+    println!("                               walk to the next later target (never fail back while");
+    println!("                               the current one is still up). Pair with --healthcheck.");
     println!("  --http-interface <addr:port>  HTTP dashboard for LB stats (e.g. :8888)");
     println!("  --traffic-log <path>         CSV file for persistent traffic history (default: ./rustproxy_traffic.csv)");
     println!("  --buffer-size <size>          Max per-direction pump buffer (default: 4mb).");
@@ -132,6 +136,12 @@ fn print_usage() {
     println!("  rustproxy --listen 127.0.0.1:8080 \\");
     println!("    --target 10.0.0.1:1080,10.0.0.2:1080,10.0.0.3:1080 \\");
     println!("    --mode tcp --lb roundrobin --http-interface :8888 --healthcheck");
+    println!();
+    println!("Sticky priority failover (11180 → 11181 → 11190 → 11191):");
+    println!("  rustproxy --listen 0.0.0.0:11175 \\");
+    println!("    --target 127.0.0.1:11180,127.0.0.1:11181,127.0.0.1:11190,127.0.0.1:11191 \\");
+    println!("    --mode tcp --lb failover --healthcheck --healthcheck-probe socks5 \\");
+    println!("    --http-interface 0.0.0.0:62075");
     println!();
     println!("Environment Variables:");
     println!("  RUSTPROXY_MANAGER=<addr:port>  Set manager address for stats reporting");
@@ -838,9 +848,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let proxy_addr = listen.clone();
                     let backends: Vec<SocketAddr> = lb.backends().iter().map(|b| b.addr).collect();
+                    let algo = lb.algorithm();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        self_test(&proxy_addr, &backends).await;
+                        self_test(&proxy_addr, &backends, algo).await;
                     });
                 }
 
@@ -950,9 +961,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Non-fatal self-test: try connecting to proxy and each backend after startup.
-async fn self_test(proxy_addr: &str, backends: &[SocketAddr]) {
+/// For failover, also reports which backend is priority-1 (first target).
+async fn self_test(proxy_addr: &str, backends: &[SocketAddr], algo: LbAlgorithm) {
     use tokio::net::TcpStream;
     use tokio::time::{timeout, Duration};
+
+    info!("[self-test] algorithm={}", algo.as_str());
+    if algo == LbAlgorithm::Failover {
+        if let Some(first) = backends.first() {
+            info!(
+                "[self-test] failover priority-1={} ({} backends, stay while healthy, else go next)",
+                first,
+                backends.len()
+            );
+        }
+    }
 
     // Test proxy listener
     match timeout(Duration::from_secs(5), TcpStream::connect(proxy_addr)).await {
@@ -961,12 +984,25 @@ async fn self_test(proxy_addr: &str, backends: &[SocketAddr]) {
         Err(_) => warn!("[self-test] FAIL: timeout connecting to proxy {}", proxy_addr),
     }
 
-    // Test each backend
-    for addr in backends {
+    // Test each backend in priority order
+    for (i, addr) in backends.iter().enumerate() {
         match timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
-            Ok(Ok(_)) => info!("[self-test] PASS: backend {} is reachable", addr),
-            Ok(Err(e)) => warn!("[self-test] WARN: backend {} unreachable: {}", addr, e),
-            Err(_) => warn!("[self-test] WARN: timeout connecting to backend {}", addr),
+            Ok(Ok(_)) => info!(
+                "[self-test] PASS: backend {} (priority {}) is reachable",
+                addr,
+                i + 1
+            ),
+            Ok(Err(e)) => warn!(
+                "[self-test] WARN: backend {} (priority {}) unreachable: {}",
+                addr,
+                i + 1,
+                e
+            ),
+            Err(_) => warn!(
+                "[self-test] WARN: timeout connecting to backend {} (priority {})",
+                addr,
+                i + 1
+            ),
         }
     }
 }

@@ -12,6 +12,12 @@ use tokio::sync::Notify;
 pub enum LbAlgorithm {
     RoundRobin,
     Random,
+    /// Sticky priority failover: `--target` order is priority 1,2,3,…
+    /// Stay on the current backend while it is enabled. When it drops,
+    /// walk to the next later target; wrap to the start only after the
+    /// tail is exhausted. Never fail back to a recovered higher-priority
+    /// backend while the current one still works.
+    Failover,
 }
 
 impl LbAlgorithm {
@@ -19,8 +25,9 @@ impl LbAlgorithm {
         match s.to_lowercase().as_str() {
             "roundrobin" | "rr" => Ok(LbAlgorithm::RoundRobin),
             "random" | "rand" => Ok(LbAlgorithm::Random),
+            "failover" | "priority" | "sticky" | "prio" => Ok(LbAlgorithm::Failover),
             _ => Err(format!(
-                "Unknown load balancing algorithm '{}'. Use 'roundrobin' or 'random'.",
+                "Unknown load balancing algorithm '{}'. Use 'roundrobin', 'random', or 'failover'.",
                 s
             )),
         }
@@ -30,6 +37,7 @@ impl LbAlgorithm {
         match self {
             LbAlgorithm::RoundRobin => "roundrobin",
             LbAlgorithm::Random => "random",
+            LbAlgorithm::Failover => "failover",
         }
     }
 }
@@ -134,6 +142,8 @@ pub struct LoadBalancer {
     backends: Vec<Arc<Backend>>,
     algorithm: LbAlgorithm,
     rr_counter: AtomicUsize,
+    /// Failover sticky index. `usize::MAX` means "not yet chosen".
+    sticky: AtomicUsize,
 }
 
 impl LoadBalancer {
@@ -157,6 +167,7 @@ impl LoadBalancer {
             backends,
             algorithm,
             rr_counter: AtomicUsize::new(0),
+            sticky: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -182,24 +193,68 @@ impl LoadBalancer {
             return None;
         }
 
-        let pick = match self.algorithm {
-            LbAlgorithm::RoundRobin => {
-                self.rr_counter.fetch_add(1, Ordering::Relaxed) % enabled_count
-            }
-            LbAlgorithm::Random => rand::thread_rng().gen_range(0..enabled_count),
-        };
+        match self.algorithm {
+            LbAlgorithm::Failover => self.next_failover(),
+            LbAlgorithm::RoundRobin | LbAlgorithm::Random => {
+                let pick = match self.algorithm {
+                    LbAlgorithm::RoundRobin => {
+                        self.rr_counter.fetch_add(1, Ordering::Relaxed) % enabled_count
+                    }
+                    LbAlgorithm::Random => rand::thread_rng().gen_range(0..enabled_count),
+                    LbAlgorithm::Failover => unreachable!(),
+                };
 
-        let mut seen = 0usize;
-        for b in &self.backends {
-            if !b.enabled.load(Ordering::Relaxed) {
-                continue;
+                let mut seen = 0usize;
+                for b in &self.backends {
+                    if !b.enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if seen == pick {
+                        return Some(Arc::clone(b));
+                    }
+                    seen += 1;
+                }
+                None
             }
-            if seen == pick {
-                return Some(Arc::clone(b));
+        }
+    }
+
+    /// Sticky priority failover. Target list order is priority 1..N.
+    /// Stay on the sticky backend while it is enabled. On failure, walk
+    /// later targets first ("go next"); wrap to the head only after the
+    /// tail is exhausted. A recovered higher-priority backend is ignored
+    /// until the current one fails.
+    fn next_failover(&self) -> Option<Arc<Backend>> {
+        let n = self.backends.len();
+        if n == 0 {
+            return None;
+        }
+        let cur = self.sticky.load(Ordering::Relaxed);
+        if cur < n && self.backends[cur].enabled.load(Ordering::Relaxed) {
+            return Some(Arc::clone(&self.backends[cur]));
+        }
+        let start = if cur < n { (cur + 1) % n } else { 0 };
+        for k in 0..n {
+            let i = (start + k) % n;
+            if self.backends[i].enabled.load(Ordering::Relaxed) {
+                self.sticky.store(i, Ordering::Relaxed);
+                return Some(Arc::clone(&self.backends[i]));
             }
-            seen += 1;
         }
         None
+    }
+
+    /// Current sticky backend id for failover, or `None` if unset / not failover.
+    pub fn sticky_id(&self) -> Option<usize> {
+        if self.algorithm != LbAlgorithm::Failover {
+            return None;
+        }
+        let cur = self.sticky.load(Ordering::Relaxed);
+        if cur < self.backends.len() {
+            Some(cur)
+        } else {
+            None
+        }
     }
 
     pub fn enable_backend(&self, id: usize) -> bool {
@@ -360,5 +415,76 @@ mod tests {
             let b = lb.next_backend().unwrap();
             assert_ne!(b.id, 1);
         }
+    }
+
+    fn failover_lb() -> LoadBalancer {
+        LoadBalancer::new(
+            "127.0.0.1:11180,127.0.0.1:11181,127.0.0.1:11190,127.0.0.1:11191",
+            LbAlgorithm::Failover,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn failover_from_str_aliases() {
+        for s in ["failover", "priority", "sticky", "prio", "FAILOVER"] {
+            assert_eq!(LbAlgorithm::from_str(s).unwrap(), LbAlgorithm::Failover);
+        }
+        assert_eq!(LbAlgorithm::Failover.as_str(), "failover");
+        assert!(LbAlgorithm::from_str("leastconn").is_err());
+    }
+
+    #[test]
+    fn failover_stays_on_priority_1_while_healthy() {
+        let lb = failover_lb();
+        for _ in 0..20 {
+            assert_eq!(lb.next_backend().unwrap().id, 0);
+        }
+        assert_eq!(lb.sticky_id(), Some(0));
+    }
+
+    #[test]
+    fn failover_goes_next_when_current_fails_and_never_fails_back() {
+        let lb = failover_lb();
+        assert_eq!(lb.next_backend().unwrap().id, 0);
+
+        // p1 down → p2
+        assert!(lb.disable_backend(0));
+        assert_eq!(lb.next_backend().unwrap().id, 1);
+        assert_eq!(lb.sticky_id(), Some(1));
+
+        // p1 recovers: stay on p2 ("if works never switch")
+        assert!(lb.enable_backend(0));
+        for _ in 0..10 {
+            assert_eq!(lb.next_backend().unwrap().id, 1);
+        }
+
+        // p2 down → p3, not back to recovered p1 ("go next")
+        assert!(lb.disable_backend(1));
+        assert_eq!(lb.next_backend().unwrap().id, 2);
+        assert!(lb.enable_backend(1));
+        assert_eq!(lb.next_backend().unwrap().id, 2);
+
+        // p3 down → p4
+        assert!(lb.disable_backend(2));
+        assert_eq!(lb.next_backend().unwrap().id, 3);
+
+        // p4 down: wrap, p1 is the first remaining enabled
+        assert!(lb.disable_backend(3));
+        assert_eq!(lb.next_backend().unwrap().id, 0);
+    }
+
+    #[test]
+    fn failover_skips_disabled_and_returns_none_when_all_down() {
+        let lb = failover_lb();
+        assert_eq!(lb.next_backend().unwrap().id, 0);
+        assert!(lb.disable_backend(0));
+        assert!(lb.disable_backend(2)); // skip p3
+        assert_eq!(lb.next_backend().unwrap().id, 1);
+        assert!(lb.disable_backend(1));
+        assert_eq!(lb.next_backend().unwrap().id, 3);
+        assert!(lb.disable_backend(3));
+        assert!(lb.next_backend().is_none());
+        assert_eq!(lb.sticky_id(), Some(3)); // last known, not cleared
     }
 }
