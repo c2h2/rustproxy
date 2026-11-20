@@ -37,6 +37,8 @@
   button.paused { background: var(--err); border-color: var(--err); color: #fff; }
   input[type=search] { cursor: text; flex: 1 1 220px; min-width: 160px; }
   .spacer { flex: 1 1 0; }
+  #dumpinfo { color: var(--muted); font-size: 12.5px; flex-basis: 100%; }
+  #dumpinfo:empty { display: none; }
   #stats { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
   main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 0; }
   main.nosel { grid-template-columns: minmax(0, 1fr); }
@@ -91,9 +93,10 @@
   <button id="clear" title="Discard every recorded flow">Clear</button>
   <input id="filter" type="search" placeholder="Filter: host, path, method or status" autocomplete="off">
   <a class="btn" id="x-har" title="HTTP Archive of the listed flows — opens in browser dev tools and most HTTP tools">Export HAR</a>
-  <a class="btn" id="x-zip" title="Zip of fetched page content, laid out as host/path">Dump sites (.zip)</a>
+  <a class="btn" id="x-zip" title="Zip of every listed record (request + response headers and bodies), an index.csv, a summary, and the fetched pages laid out as host/path">Dump (.zip)</a>
   <a class="btn" id="x-pcap" href="/export/pcap" download title="Decrypted packet capture for Wireshark">pcap</a>
   <span id="stats"></span>
+  <span id="dumpinfo"></span>
 </header>
 <main class="nosel">
   <div id="list">
@@ -128,6 +131,7 @@
 (function () {
   'use strict';
   var flows = new Map(), rowEls = new Map();
+  var dumping = false;
   var since = 0, epoch = null, selected = null, tab = 'headers', detail = null, recording = true;
   var $ = function (id) { return document.getElementById(id); };
   // Deep link: /traffic#flow=12&tab=response opens that flow.
@@ -231,6 +235,7 @@
       rec.textContent = recording ? '● Recording' : '❚❚ Paused';
       rec.className = recording ? 'primary' : 'paused';
       var shown = applyFilter();
+      if (!dumping) $('x-zip').textContent = 'Dump ' + shown + ' record' + (shown === 1 ? '' : 's') + ' (.zip)';
       $('stats').textContent = (shown === flows.size ? flows.size : shown + ' of ' + flows.size) +
         ' flows · ' + size(d.stored_bytes) + ' of ' + size(d.max_bytes) + ' stored';
       $('empty').hidden = flows.size > 0;
@@ -384,6 +389,36 @@
   $('clear').addEventListener('click', function () {
     if (confirm('Discard all ' + flows.size + ' recorded flows?')) fetch('/api/clear', { method: 'POST' });
   });
+  // Fetch the dump ourselves so the counts the server reports can be shown.
+  $('x-zip').addEventListener('click', function (ev) {
+    ev.preventDefault();
+    if (dumping) return;
+    var btn = this, href = btn.getAttribute('href'), info = $('dumpinfo');
+    dumping = true; btn.textContent = 'Dumping…'; info.textContent = '';
+    fetch(href).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      var name = (/filename="([^"]+)"/.exec(r.headers.get('content-disposition') || '') || [])[1] || 'rustproxy.zip';
+      var st = {};
+      (r.headers.get('x-dump-stats') || '').split(';').forEach(function (kv) {
+        var p = kv.split('='); if (p[0]) st[p[0]] = Number(p[1]);
+      });
+      return r.blob().then(function (b) { return { blob: b, name: name, st: st }; });
+    }).then(function (d) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(d.blob); a.download = d.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 10000);
+      var s = d.st;
+      info.textContent = 'Dumped ' + s.records + ' records (' + s.responses + ' with a response) · ' +
+        'request headers ' + size(s.req_headers) + ', bodies ' + size(s.req_bodies) + ' · ' +
+        'response headers ' + size(s.resp_headers) + ', bodies ' + size(s.resp_bodies) + ' · ' +
+        s.site_files + ' site files · ' + size(d.blob.size) + ' zip' +
+        (s.skipped ? ' · ' + s.skipped + ' records left out (zip entry limit)' : '');
+    }).catch(function (e) {
+      info.textContent = 'Dump failed (' + e.message + ')';
+    }).finally(function () { dumping = false; });
+  });
+
   fetch('/export/pcap', { method: 'HEAD' }).then(function (r) { if (!r.ok) $('x-pcap').hidden = true; });
   applyFilter();
   poll();

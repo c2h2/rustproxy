@@ -919,18 +919,149 @@ pub fn dump_path(flow: &Flow) -> String {
     parts.join("/")
 }
 
-/// Zip of every successfully fetched response body, laid out as
-/// `host/path` — a browsable dump of the visited sites. When one URL was
-/// fetched several times the most recent copy wins.
-pub fn export_site_zip(flows: &[Flow]) -> Vec<u8> {
-    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+/// What a site dump contains, reported to the browser alongside the zip.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DumpStats {
+    /// Flows written to `_records/` (every flow, whatever its status).
+    pub records: usize,
+    /// Of those, how many have a response (status line + headers).
+    pub responses: usize,
+    pub req_header_bytes: u64,
+    pub req_body_bytes: u64,
+    pub resp_header_bytes: u64,
+    pub resp_body_bytes: u64,
+    /// Site files under `host/path` (successful response bodies).
+    pub site_files: usize,
+    /// Flows left out because the zip hit its entry limit.
+    pub skipped: usize,
+}
+
+fn head_text(start_line: &str, headers: &[(String, String)]) -> Vec<u8> {
+    let mut out = format!("{start_line}\r\n");
+    for (k, v) in headers {
+        out.push_str(&format!("{k}: {v}\r\n"));
+    }
+    out.push_str("\r\n");
+    out.into_bytes()
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Zip of the recorded traffic:
+/// - `host/path` — every successfully fetched response body, a browsable
+///   dump of the visited sites (most recent copy wins on repeats);
+/// - `_records/<id>.http` — every flow in full: request line, headers and
+///   body, then status line, headers and body (bodies as stored, with any
+///   `Content-Encoding` removed);
+/// - `_records/index.csv` and `_summary.txt` — counts and sizes per flow.
+pub fn export_site_zip(flows: &[Flow]) -> (Vec<u8>, DumpStats) {
+    // Classic zip counts entries in 16 bits; leave room for the index files.
+    const MAX_ENTRIES: usize = 65_000;
+    let mut stats = DumpStats::default();
+    let mut site: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for f in flows {
         let ok = matches!(f.status, Some(200..=299)) && f.state == "done" && !f.resp_body.is_empty();
         if ok && !f.method.eq_ignore_ascii_case("HEAD") {
-            files.insert(dump_path(f), f.decoded_body(true));
+            site.insert(dump_path(f), f.decoded_body(true));
         }
     }
-    zip_stored(&files)
+
+    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut csv = String::from(
+        "id,time,method,url,status,state,ms,client,server,req_header_bytes,req_body_bytes,req_body_stored,resp_header_bytes,resp_body_bytes,resp_body_stored\n",
+    );
+    for f in flows {
+        if site.len() + files.len() >= MAX_ENTRIES {
+            stats.skipped += 1;
+            continue;
+        }
+        let req_head = head_text(&format!("{} {} {}", f.method, f.path, f.req_version), &f.req_headers);
+        let req_body = f.decoded_body(false);
+        let mut rec = format!(
+            "# rustproxy record {} · {} · {} -> {} · {}{}\r\n",
+            f.id,
+            iso_time(f.started_ms),
+            f.client,
+            f.server,
+            f.state,
+            f.duration_ms.map(|ms| format!(" · {ms} ms")).unwrap_or_default()
+        )
+        .into_bytes();
+        rec.extend_from_slice(&req_head);
+        rec.extend_from_slice(&req_body);
+        stats.req_header_bytes += req_head.len() as u64;
+        stats.req_body_bytes += f.req_size;
+
+        let mut resp_head_len = 0;
+        if let Some(status) = f.status {
+            let resp_head = head_text(&format!("{} {} {}", f.resp_version, status, f.reason), &f.resp_headers);
+            resp_head_len = resp_head.len();
+            rec.extend_from_slice(b"\r\n\r\n");
+            rec.extend_from_slice(&resp_head);
+            rec.extend_from_slice(&f.decoded_body(true));
+            stats.responses += 1;
+            stats.resp_header_bytes += resp_head_len as u64;
+            stats.resp_body_bytes += f.resp_size;
+        }
+        if f.req_size > f.req_body.len() as u64 || f.resp_size > f.resp_body.len() as u64 {
+            rec.extend_from_slice(b"\r\n# body truncated: only the first part was kept in memory\r\n");
+        }
+        files.insert(format!("_records/{:06}.http", f.id), rec);
+        stats.records += 1;
+
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            f.id,
+            iso_time(f.started_ms),
+            csv_field(&f.method),
+            csv_field(&f.url()),
+            f.status.map(|s| s.to_string()).unwrap_or_default(),
+            f.state,
+            f.duration_ms.map(|s| s.to_string()).unwrap_or_default(),
+            csv_field(&f.client),
+            csv_field(&f.server),
+            req_head.len(),
+            f.req_size,
+            f.req_body.len(),
+            resp_head_len,
+            f.resp_size,
+            f.resp_body.len(),
+        ));
+    }
+    stats.site_files = site.len();
+
+    let summary = format!(
+        "rustproxy traffic dump, {}\r\n\r\n\
+         records:            {}\r\n\
+         with a response:    {}\r\n\
+         request headers:    {} bytes\r\n\
+         request bodies:     {} bytes\r\n\
+         response headers:   {} bytes\r\n\
+         response bodies:    {} bytes\r\n\
+         site files:         {}\r\n{}\
+         \r\n_records/<id>.http  each request and response in full\r\n\
+         _records/index.csv  one line per record with its sizes\r\n\
+         <host>/<path>       successful response bodies, laid out as the sites\r\n",
+        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        stats.records,
+        stats.responses,
+        stats.req_header_bytes,
+        stats.req_body_bytes,
+        stats.resp_header_bytes,
+        stats.resp_body_bytes,
+        stats.site_files,
+        if stats.skipped > 0 { format!("NOT INCLUDED:       {} records (zip entry limit)\r\n", stats.skipped) } else { String::new() },
+    );
+    files.insert("_records/index.csv".into(), csv.into_bytes());
+    files.insert("_summary.txt".into(), summary.into_bytes());
+    files.extend(site);
+    (zip_stored(&files), stats)
 }
 
 /// Minimal ZIP writer (stored entries, UTF-8 names).
@@ -1152,14 +1283,24 @@ mod tests {
         assert_eq!(dump_path(&img), "site.test/img/a.png_v=2.png");
         assert_eq!(dump_path(&api), "site.test/api/etc/items.json", "no path traversal");
 
-        let flows = vec![page, img, api, failed];
-        let zip = export_site_zip(&flows);
+        let mut flows = vec![page, img, api, failed];
+        for (i, f) in flows.iter_mut().enumerate() {
+            f.id = i as u64 + 1;
+        }
+        let (zip, stats) = export_site_zip(&flows);
         assert_eq!(&zip[..4], b"PK\x03\x04");
         assert!(find(&zip, b"site.test/index.html<html>hi</html>").is_some(), "stored decoded");
-        assert!(find(&zip, b"missing").is_none(), "error responses are not part of the dump");
+        assert!(find(&zip, b"site.test/missing.html").is_none(), "error responses are not site files");
+        assert!(find(&zip, b"_records/000004.http").is_some(), "every flow gets a record");
+        assert!(find(&zip, b"_summary.txt").is_some());
+        assert_eq!(stats.records, 4);
+        assert_eq!(stats.responses, 4);
+        assert_eq!(stats.site_files, 3);
+        assert_eq!(stats.resp_body_bytes, flows.iter().map(|f| f.resp_size).sum::<u64>());
         let eocd = &zip[zip.len() - 22..];
         assert_eq!(&eocd[..4], b"PK\x05\x06");
-        assert_eq!(u16::from_le_bytes([eocd[10], eocd[11]]), 3);
+        // 3 site files + 4 records + index.csv + _summary.txt
+        assert_eq!(u16::from_le_bytes([eocd[10], eocd[11]]), 9);
 
         let har = export_har(&flows);
         let entries = har["log"]["entries"].as_array().unwrap();

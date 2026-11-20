@@ -326,14 +326,27 @@ async fn export_zip(State(state): St, Query(q): Query<HashMap<String, String>>) 
         Err(e) => return e,
     };
     let filter = q.get("q").cloned().unwrap_or_default();
-    let zip = tokio::task::spawn_blocking(move || mitm_record::export_site_zip(&rec.snapshot(&filter)))
+    let (zip, s) = tokio::task::spawn_blocking(move || mitm_record::export_site_zip(&rec.snapshot(&filter)))
         .await
         .unwrap_or_default();
+    // Counts for the traffic page, which fetches the dump and reports them.
+    let counts = format!(
+        "records={};responses={};req_headers={};req_bodies={};resp_headers={};resp_bodies={};site_files={};skipped={}",
+        s.records,
+        s.responses,
+        s.req_header_bytes,
+        s.req_body_bytes,
+        s.resp_header_bytes,
+        s.resp_body_bytes,
+        s.site_files,
+        s.skipped
+    );
     (
         [
             (CONTENT_TYPE, "application/zip".to_string()),
             (CONTENT_DISPOSITION, export_name("zip")),
             (CACHE_CONTROL, "no-store".to_string()),
+            (axum::http::HeaderName::from_static("x-dump-stats"), counts),
         ],
         zip,
     )

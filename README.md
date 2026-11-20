@@ -328,7 +328,7 @@ rustproxy --listen 0.0.0.0:8080 --mode http --mitm --http-interface :8889
 - **Per flow**: request and response headers, and both bodies — text and JSON shown (JSON pretty-printed), images previewed, anything else as a hex dump, each downloadable. Bodies are shown decompressed (gzip, deflate, brotli); "Download as sent" gives the original bytes.
 - **Record / pause** and **Clear**.
 - **Export HAR**: the listed flows as an HTTP Archive, which browser dev tools and most HTTP tools import.
-- **Dump sites (.zip)**: every successfully fetched response body laid out as `host/path` (`index.html` for directory URLs), decompressed — a browsable copy of what was visited. When a URL was fetched more than once the latest copy wins.
+- **Dump (.zip)**: the listed flows (the filter applies), with the record count on the button and, after the download, the number of records and the bytes of request/response headers and bodies it holds. Inside: `_records/<id>.http` — every flow in full (request line, headers, body; then status line, headers, body; decompressed), so repeated calls to one URL each keep their own response; `_records/index.csv` with one line of sizes per flow; `_summary.txt` with the totals; and every successfully fetched response body laid out as `host/path` (`index.html` for directory URLs) — a browsable copy of what was visited, where the latest copy of a URL wins.
 - **pcap**: download of the decrypted capture file for Wireshark.
 - **What is listening**: the bar at the top of both pages shows the proxy and web-interface addresses and whether each is IPv4 or IPv6. `0.0.0.0:8080` is IPv4 only; use `[::]:8080` to listen on IPv6.
 - **Deep links**: `/traffic#flow=12&tab=response` opens a specific flow.
