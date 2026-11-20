@@ -21,3 +21,7 @@ Thumbs.db
 
 # Generated data
 rustproxy_traffic.csv
+
+# TLS interception (--mitm): CA private key and decrypted captures
+/rustproxy-ca/
+*.pcap

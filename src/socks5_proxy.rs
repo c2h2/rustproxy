@@ -510,7 +510,7 @@ impl Socks5Proxy {
         Ok(())
     }
 
-    async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, _target_addr: String, stats: Option<Arc<StatsCollector>>, conn_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn proxy_data(&self, client_stream: TcpStream, target_stream: TcpStream, client_addr: SocketAddr, target_addr: String, stats: Option<Arc<StatsCollector>>, conn_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         // Keep both legs of the tunnel warm through NATs and detect dead peers.
         // Previously only the target was tuned, so idle client-side NAT mappings
         // silently expired and the next write looked like a random disconnect.
@@ -521,8 +521,12 @@ impl Socks5Proxy {
         // The previous tokio::join! never cancelled the surviving direction,
         // so an abrupt client close with an idle target leaked the task and
         // both sockets forever. run_pumps propagates the break both ways.
-        let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) =
-            crate::tcp_proxy::run_pumps(client_stream, target_stream, self.buffer_size, Some(client_addr.ip())).await;
+        // With --mitm, TLS inside the tunnel is terminated and re-encrypted;
+        // anything else takes the same run_pumps relay.
+        let (bytes_to_target, bytes_to_client, e_c2s, e_s2c) = match crate::mitm::global() {
+            Some(mitm) => mitm.relay(client_stream, client_addr, &target_addr, target_stream, self.buffer_size).await,
+            None => crate::tcp_proxy::run_pumps(client_stream, target_stream, self.buffer_size, Some(client_addr.ip())).await,
+        };
 
         if let Some(e) = e_c2s {
             debug!("SOCKS5 client->target ended after {} bytes for {}: {}", bytes_to_target, client_addr, e);

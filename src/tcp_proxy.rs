@@ -1464,6 +1464,43 @@ pub(crate) async fn run_pumps<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let (ri, wi) = tokio::io::split(inbound);
+    let (ro, wo) = outbound.into_split();
+    run_pump_halves(ri, wi, ro, wo, buf_size, client_ip).await
+}
+
+/// [`run_pumps`] for an outbound leg that is not a bare `TcpStream` (e.g. the
+/// upstream TLS session of an intercepted `--mitm` tunnel). Same teardown,
+/// buffer and rate-limit behaviour.
+pub(crate) async fn run_pumps_io<S, O>(
+    inbound: S,
+    outbound: O,
+    buf_size: usize,
+    client_ip: Option<std::net::IpAddr>,
+) -> (u64, u64, Option<io::Error>, Option<io::Error>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    O: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (ri, wi) = tokio::io::split(inbound);
+    let (ro, wo) = tokio::io::split(outbound);
+    run_pump_halves(ri, wi, ro, wo, buf_size, client_ip).await
+}
+
+async fn run_pump_halves<RI, WI, RO, WO>(
+    ri: RI,
+    wi: WI,
+    ro: RO,
+    wo: WO,
+    buf_size: usize,
+    client_ip: Option<std::net::IpAddr>,
+) -> (u64, u64, Option<io::Error>, Option<io::Error>)
+where
+    RI: AsyncRead + Unpin,
+    WI: AsyncWrite + Unpin,
+    RO: AsyncRead + Unpin,
+    WO: AsyncWrite + Unpin,
+{
     let mut max_buf = crate::tcp_tune::clamp_pump_buffer(buf_size);
     let limiter = client_ip.and_then(crate::rate_limit::limiter_for);
     if let Some(ref l) = limiter {
@@ -1475,9 +1512,6 @@ where
     }
     let tx = AtomicU64::new(0); // client -> server
     let rx = AtomicU64::new(0); // server -> client
-
-    let (ri, wi) = tokio::io::split(inbound);
-    let (ro, wo) = outbound.into_split();
 
     let c2s = pump(ri, wo, &tx, max_buf, limiter.clone());
     let s2c = pump(ro, wi, &rx, max_buf, limiter);

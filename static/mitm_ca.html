@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RustProxy CA certificate</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #5b6270;
+    --line: #dfe3ea; --accent: #0b7a4b; --accent-text: #ffffff;
+    --code: #f0f2f6; --warn-bg: #fff6e0; --warn-line: #e8c56a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101319; --panel: #181c24; --text: #e8eaef; --muted: #9aa3b2;
+      --line: #2a303b; --accent: #34c98a; --accent-text: #06261a;
+      --code: #222834; --warn-bg: #2b2414; --warn-line: #6b5621;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 28px 18px 56px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  h2 { font-size: 1.02rem; margin: 0; }
+  p { margin: 10px 0; }
+  .lead { color: var(--muted); margin-top: 0; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 9px; padding: 16px; margin-top: 16px;
+  }
+  .downloads { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  a.btn {
+    display: inline-block; padding: 8px 14px; border-radius: 7px;
+    background: var(--accent); color: var(--accent-text); border: 1px solid var(--accent);
+    font-weight: 600; text-decoration: none;
+  }
+  a.btn.alt { background: var(--panel); color: var(--text); border-color: var(--line); font-weight: 400; }
+  a.btn.alt:hover { border-color: var(--accent); }
+  .label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-top: 16px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  code { background: var(--code); padding: 2px 5px; border-radius: 5px; }
+  .fingerprint { word-break: break-all; margin-top: 4px; }
+  pre {
+    background: var(--code); padding: 10px; border-radius: 7px;
+    overflow-x: auto; margin: 10px 0; font-size: 12.5px;
+  }
+  pre code { background: none; padding: 0; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; margin-top: 10px; }
+  summary { cursor: pointer; padding: 12px 16px; font-weight: 600; }
+  details > div { padding: 0 16px 14px; border-top: 1px solid var(--line); }
+  ol { padding-left: 22px; margin: 12px 0; }
+  li { margin: 7px 0; }
+  .path { font-weight: 600; }
+  .warn { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 9px; padding: 12px 16px; margin-top: 20px; }
+  .result { margin-top: 14px; padding: 12px 14px; border-radius: 7px; border: 1px solid var(--line); }
+  .result.good { border-color: var(--accent); }
+  .result.bad { border-color: #b3261e; }
+  .result b.head { display: block; margin-bottom: 4px; }
+  .result ol { margin: 8px 0 0; }
+  .note { color: var(--muted); font-size: 13.5px; }
+</style>
+</head>
+<body>
+{{TOPBAR}}
+<main>
+  <h1>Install the CA certificate</h1>
+  <p class="lead">Install this certificate on a device to let it send HTTPS through this proxy for inspection.</p>
+
+  <div class="card">
+    <h2>1. Download</h2>
+    <div class="downloads">
+      <a class="btn" href="/ca.crt">Download certificate (.crt)</a>
+      <a class="btn alt" href="/ca.cer">Windows / DER (.cer)</a>
+    </div>
+    <div class="label">SHA-256 fingerprint</div>
+    <div class="mono fingerprint">{{FINGERPRINT}}</div>
+    <p class="note">This page is plain HTTP. Before trusting the certificate, compare this fingerprint with the one your device shows for it.</p>
+
+    <div class="label">Proxy to configure on the device</div>
+    <div class="mono"><span class="proxy-host">this-host</span>:{{PROXY_PORT}} &nbsp;({{MODE}} proxy)</div>
+  </div>
+
+  <h2 style="margin-top:26px">2. Install and trust</h2>
+
+  <details id="ios">
+    <summary>iPhone / iPad</summary>
+    <div>
+      <ol>
+        <li>Open this page in <b>Safari</b> and tap <b>Download certificate</b>. Tap <b>Allow</b> when asked to download a configuration profile.</li>
+        <li>Open <span class="path">Settings</span> and tap <b>Profile Downloaded</b> near the top (or <span class="path">Settings → General → VPN &amp; Device Management</span>). Tap the profile, then <b>Install</b>, and enter your passcode.</li>
+        <li>Turn on full trust — this step is separate and easy to miss:<br>
+          <span class="path">Settings → General → About → Certificate Trust Settings</span>, then switch on the RustProxy certificate (named <b>rustproxy MITM CA</b> unless you supplied your own).</li>
+        <li>Point the device at the proxy: <span class="path">Settings → Wi-Fi → ⓘ next to your network → Configure Proxy → Manual</span>. Server <code class="proxy-host">this-host</code>, port <code>{{PROXY_PORT}}</code>.</li>
+      </ol>
+      <p class="note">The Wi-Fi proxy setting on iOS speaks HTTP proxy only, so run rustproxy with <code>--mode http</code> for iPhones and iPads. Apps that pin their certificates will refuse to connect; list their hosts in <code>--mitm-bypass</code>.</p>
+      <p class="note">To remove: <span class="path">Settings → General → VPN &amp; Device Management</span> → the profile → <b>Remove Profile</b>.</p>
+    </div>
+  </details>
+
+  <details id="mac">
+    <summary>macOS</summary>
+    <div>
+      <ol>
+        <li>Download the certificate and double-click <code>rustproxy-ca.crt</code>. Keychain Access opens; add it to the <b>System</b> keychain (or <b>login</b> for just your user).</li>
+        <li>In Keychain Access, find the certificate (named <b>rustproxy MITM CA</b> unless you supplied your own), double-click it, expand <b>Trust</b>, and set <b>When using this certificate</b> to <b>Always Trust</b>. Close the window and confirm with your password.</li>
+        <li>Set the proxy: <span class="path">System Settings → Network → your connection → Details → Proxies</span>. Enable <span class="mode-http"><b>Web proxy (HTTP)</b> and <b>Secure web proxy (HTTPS)</b></span><b class="mode-socks">SOCKS proxy</b> with server <code class="proxy-host">this-host</code>, port <code>{{PROXY_PORT}}</code>.</li>
+      </ol>
+      <p>Or from Terminal:</p>
+<pre><code>sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain ~/Downloads/rustproxy-ca.crt</code></pre>
+      <p class="note">Firefox keeps its own certificate store: <span class="path">Settings → Privacy &amp; Security → Certificates → View Certificates → Authorities → Import</span>, and tick “Trust this CA to identify websites”.</p>
+      <p class="note">To remove: delete the certificate in Keychain Access.</p>
+    </div>
+  </details>
+
+  <details id="windows">
+    <summary>Windows</summary>
+    <div>
+      <ol>
+        <li>Download the <b>.cer</b> file and double-click it, then choose <b>Install Certificate…</b></li>
+        <li>Pick <b>Local Machine</b> (all users, needs administrator) or <b>Current User</b>, then <b>Next</b>.</li>
+        <li>Select <b>Place all certificates in the following store</b>, click <b>Browse</b>, and choose <b>Trusted Root Certification Authorities</b>. The automatic option puts it in the wrong store.</li>
+        <li>Finish the wizard and accept the security warning; check that the thumbprint matches the certificate you downloaded.</li>
+        <li>Set the proxy: <span class="path">Settings → Network &amp; Internet → Proxy → Manual proxy setup</span>. Address <code class="proxy-host">this-host</code>, port <code>{{PROXY_PORT}}</code>.</li>
+      </ol>
+      <p>Or from an administrator Command Prompt:</p>
+<pre><code>certutil -addstore -f Root "%USERPROFILE%\Downloads\rustproxy-ca.cer"</code></pre>
+      <p class="note">The Windows proxy setting is an HTTP proxy, so run rustproxy with <code>--mode http</code>. Firefox uses its own store unless <code>security.enterprise_roots.enabled</code> is turned on in <code>about:config</code>.</p>
+      <p class="note">To remove: run <code>certmgr.msc</code> (or <code>certlm.msc</code> for Local Machine), open <span class="path">Trusted Root Certification Authorities → Certificates</span>, and delete it.</p>
+    </div>
+  </details>
+
+  <h2 style="margin-top:26px">3. Check this device</h2>
+  <div class="card">
+    <p style="margin-top:0">After installing the certificate and setting the proxy, run this on the device itself. It makes one HTTPS request and asks the proxy what it saw from this device.</p>
+    <div class="downloads"><a class="btn" href="#" id="check">Test this device</a></div>
+    <div id="check-result" class="result" hidden></div>
+  </div>
+
+  <div class="warn">
+    <b>Only install this on devices you own or are authorised to test.</b>
+    A device that trusts this certificate lets whoever holds the proxy's private key read and alter its HTTPS traffic. Remove the certificate when you are finished.
+  </div>
+</main>
+<script>
+  // Show the address this page was reached at as the proxy host, and open
+  // the instructions for the visiting device.
+  var host = location.hostname;
+  document.querySelectorAll('.proxy-host').forEach(function (el) { el.textContent = host; });
+
+  var socks = '{{MODE}}' === 'socks5';
+  document.querySelectorAll(socks ? '.mode-http' : '.mode-socks').forEach(function (el) { el.remove(); });
+
+  // Self-test: one HTTPS request to a public site, then ask the proxy whether
+  // this device's address just accepted or rejected one of its certificates.
+  var result = document.getElementById('check-result');
+  function show(kind, head, lines) {
+    result.hidden = false;
+    result.className = 'result ' + kind;
+    result.textContent = '';
+    var b = document.createElement('b'); b.className = 'head'; b.textContent = head; result.appendChild(b);
+    if (lines.length === 1) { result.appendChild(document.createTextNode(lines[0])); return; }
+    var ol = document.createElement('ol');
+    lines.forEach(function (t) { var li = document.createElement('li'); li.textContent = t; ol.appendChild(li); });
+    result.appendChild(ol);
+  }
+  document.getElementById('check').addEventListener('click', function (e) {
+    e.preventDefault();
+    var started = Date.now();
+    show('', 'Testing…', ['Requesting https://example.com/ from this device.']);
+    var done = function () {
+      fetch('/trust-status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
+        var windowMs = Date.now() - started + 3000;
+        var ok = s.ok_ms_ago !== null && s.ok_ms_ago <= windowMs;
+        var failed = s.fail_ms_ago !== null && s.fail_ms_ago <= windowMs;
+        if (ok) {
+          show('good', 'Working: this device trusts the certificate.',
+            ['HTTPS from ' + s.ip + ' went through the proxy and was accepted. Apps that still fail are pinning their own certificates; add their hosts to --mitm-bypass.']);
+        } else if (failed) {
+          show('bad', 'This device reached the proxy but rejected its certificate.', [
+            'Compare the fingerprint of the certificate installed on this device with the one shown above. If it differs, remove the installed one and download it again from this page.',
+            'iPhone / iPad: installing the profile is not enough. Open Settings → General → About → Certificate Trust Settings and switch on full trust for it.',
+            'macOS: in Keychain Access the certificate must be set to Always Trust. Windows: it must be in Trusted Root Certification Authorities.',
+            'Reported by the proxy: ' + s.fail_reason
+          ]);
+        } else {
+          show('bad', 'No HTTPS from this device reached the proxy.', [
+            'The proxy saw nothing from ' + s.ip + ' during the test, so this device is not sending its traffic here.',
+            'Set its HTTP proxy to ' + host + ' port {{PROXY_PORT}} (step 2), then test again.'
+          ]);
+        }
+      }).catch(function () { show('bad', 'Could not ask the proxy for the result.', ['Reload this page and try again.']); });
+    };
+    fetch('https://example.com/?rustproxy-check=' + started, { mode: 'no-cors', cache: 'no-store' })
+      .then(done, function () { setTimeout(done, 600); });
+  });
+
+  var ua = navigator.userAgent;
+  var touchMac = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1; // iPadOS
+  var id = /iPhone|iPad|iPod/.test(ua) || touchMac ? 'ios'
+         : /Macintosh|Mac OS X/.test(ua) ? 'mac'
+         : /Windows/.test(ua) ? 'windows' : null;
+  if (id) { document.getElementById(id).open = true; }
+</script>
+</body>
+</html>

@@ -16,6 +16,7 @@ This project was inspired by the limitations of HAProxy + SOCKS load balancing s
 - **VMess listener**: AEAD mode on a separate port (TCP LB path)
 - **HTTP Proxy**: Forward proxy + HTTPS `CONNECT` tunnels
 - **SOCKS5 Proxy**: CONNECT + UDP ASSOCIATE, optional user/pass auth
+- **TLS Interception**: `--mitm` decrypts HTTPS in the HTTP/SOCKS5 modes; browse the recorded requests in a web UI, export HAR / a zip of the visited sites, or open the decrypted pcap in Wireshark
 - **Web Dashboard**: LB stats, enable/disable backends, traffic history
 - **Healthcheck**: TCP or SOCKS5 probes; disable after consecutive failures (drain, no kill)
 - **Self-update**: `rustproxy --update` from GitHub releases
@@ -120,6 +121,7 @@ rustproxy --update
 - `--cache-size <size>` - Legacy CLI size (outbound stream pooling is **disabled** by design; kept for compatibility). Examples: `0`, `256kb`, `1mb`
 - `--buffer-size <size>` - Max per-direction pump buffer (default **4mb**). Buffers are adaptive: each direction starts at **8 KiB**, doubles whenever a read fills the buffer, and halves after ~10 s idle — so idle tunnels cost ~16 KiB while bulk streams grow to full size. Total pump memory across all connections is hard-capped at **1 GiB**; once spent, pumps stop growing instead of failing.
 - `--limit-per-ip-mb <mb>` - Per-client-IP speed limit in MB/s; fractions allowed (`0.1` = 100 KB/s, `1`, `1000`). All connections from the same IP share one token bucket (upload + download combined, one second of burst), so parallel connections can't multiply the limit. Applies to every relay mode. Default: unlimited.
+- `--mitm` - TLS interception for `--mode http` / `--mode socks5`; see [TLS Interception](#tls-interception-https-analysis). Related: `--mitm-ca-dir`, `--mitm-regen-ca`, `--http-interface` (traffic browser + CA download page), `--mitm-web-auth`, `--mitm-store-mb`, `--mitm-h2`, `--mitm-pcap`, `--mitm-keylog`, `--mitm-bypass`, `--mitm-insecure`.
 - `--tcp-keepalive-time <secs>` - Keepalive idle before first probe (default **120**)
 - `--tcp-keepalive-interval <secs>` - Keepalive probe interval (default **30**)
 - `--tcp-keepalive-retries <n>` - Unanswered probes before drop (default **3**)
@@ -283,6 +285,88 @@ rustproxy --listen 127.0.0.1:8080 --mode http --dns tcp://1.1.1.1,tcp://8.8.8.8
 ```
 
 When `--dns` is set, the system resolver is **not** used — every hostname (TCP, SOCKS5, HTTP, Shadowsocks) is resolved through the configured upstreams in order.
+
+## TLS Interception (HTTPS analysis)
+
+`--mitm` turns the HTTP (`CONNECT`) and SOCKS5 modes into an intercepting proxy for debugging your own traffic. TLS inside a tunnel is terminated with a certificate minted on the fly from a local CA, re-encrypted to the real server, and the decrypted bytes in between are written to a pcap file that Wireshark opens as ordinary HTTP/1.1 or HTTP/2.
+
+```bash
+# 1. Start the proxy. The first run generates ./rustproxy-ca/ca.crt + ca.key
+rustproxy --listen 127.0.0.1:8080 --mode http --mitm
+
+# 2. Send traffic through it, trusting the generated CA
+curl --cacert rustproxy-ca/ca.crt -x http://127.0.0.1:8080 https://example.com/
+
+# 3. Open the decrypted capture (or follow it live)
+wireshark rustproxy_mitm.pcap
+tail -c +1 -f rustproxy_mitm.pcap | wireshark -k -i -
+```
+
+**Installing the CA on other devices.** Add `--http-interface` and the proxy serves a download page with step-by-step instructions for iOS, macOS and Windows:
+
+```bash
+rustproxy --listen 0.0.0.0:8080 --mode http --mitm --http-interface :8889
+# on the phone / other machine, open  http://<proxy-ip>:8889/
+```
+
+![CA install page with download buttons, fingerprint and per-platform instructions](docs/mitm-ca.png)
+
+The page (at `/`) offers the certificate as `/ca.crt` (PEM) and `/ca.cer` (DER, for Windows), shows its SHA-256 fingerprint to compare against what the device displays, and opens the instructions matching the visiting device. Only the public certificate is served, never `ca.key`. The page is plain HTTP with no authentication, so bind it to a network you trust.
+
+**Browsing recorded traffic.** The same interface has a traffic browser at `/traffic`, in the spirit of Wireshark's packet list but at the HTTP level:
+
+![Traffic browser: flow list on the left, headers of the selected request on the right](docs/mitm-traffic.png)
+
+*Sample traffic (curl against example.com, httpbin.org and wikipedia.org).*
+
+```bash
+rustproxy --listen 0.0.0.0:8080 --mode http --mitm --http-interface :8889
+# on the proxy machine:  http://127.0.0.1:8889/traffic
+```
+
+- **Flow list**, live: time, method, status, host, path, content type, size, duration and the **from → to** addresses (client → real server), with a filter over host, path, method and status.
+- **Per flow**: request and response headers, and both bodies — text and JSON shown (JSON pretty-printed), images previewed, anything else as a hex dump, each downloadable. Bodies are shown decompressed (gzip, deflate, brotli); "Download as sent" gives the original bytes.
+- **Record / pause** and **Clear**.
+- **Export HAR**: the listed flows as an HTTP Archive, which browser dev tools and most HTTP tools import.
+- **Dump sites (.zip)**: every successfully fetched response body laid out as `host/path` (`index.html` for directory URLs), decompressed — a browsable copy of what was visited. When a URL was fetched more than once the latest copy wins.
+- **pcap**: download of the decrypted capture file for Wireshark.
+- **What is listening**: the bar at the top of both pages shows the proxy and web-interface addresses and whether each is IPv4 or IPv6. `0.0.0.0:8080` is IPv4 only; use `[::]:8080` to listen on IPv6.
+- **Deep links**: `/traffic#flow=12&tab=response` opens a specific flow.
+
+Exports honour the current filter, so `example.com` in the filter box exports just that site.
+
+Things to know:
+
+- **Access.** Recorded traffic includes passwords and cookies, so without a login `/traffic` and its API answer only requests from the proxy machine itself. To open it from another machine set `--mitm-web-auth user:password` (HTTP Basic, sent in clear text over plain HTTP — use it on a network you trust). The CA page stays public either way.
+- **HTTP/2 is steered to HTTP/1.1 while recording.** The browser parses HTTP/1.x, so with `--http-interface` set the proxy does not offer `h2` to servers and both legs fall back to HTTP/1.1. Sites behave the same in almost every case; pass `--mitm-h2` if you need real HTTP/2, at the cost of those connections not being listed (they still land in the pcap).
+- **Plain HTTP is listed too**, both forward-proxied requests and `http://` inside SOCKS5/CONNECT tunnels. WebSocket connections are listed up to the `101` upgrade; their frames are not parsed.
+- **Memory.** Flows live in memory only and are lost on restart. Up to 16 MiB of each body is kept (the real size is still shown), and `--mitm-store-mb` caps the total, dropping the oldest flows first.
+
+**The CA is generated once.** If `ca.crt` and `ca.key` already exist they are always reused, so devices that trust the CA keep working across restarts. If only one of the two files is present rustproxy refuses to start rather than replace it. `--mitm-regen-ca` is the only way to get a new CA; it keeps the previous pair as `ca.crt.old` / `ca.key.old`, and every device has to install and trust the new certificate.
+
+| Option | Meaning |
+| --- | --- |
+| `--mitm` | Enable interception (`http` and `socks5` modes only) |
+| `--mitm-ca-dir <dir>` | Where `ca.crt` / `ca.key` live; generated only if missing (default `./rustproxy-ca`). Drop in your own CA pair (PKCS#8 key) to reuse one |
+| `--mitm-regen-ca` | Force a new CA even though one exists (old pair kept as `*.old`) |
+| `--http-interface <addr:port>` | With `--mitm`: web interface — `/traffic` (record, browse, export) and `/` (CA download with iOS / macOS / Windows instructions) |
+| `--mitm-web-auth <user:pass>` | Login for `/traffic`. Without it the traffic browser only answers the machine rustproxy runs on |
+| `--mitm-store-mb <MiB>` | Memory for recorded bodies (default 256); the oldest flows are dropped first |
+| `--mitm-h2` | Keep HTTP/2 on intercepted connections (they reach the pcap but are not listed in the traffic browser) |
+| `--mitm-pcap <file>` | Decrypted capture, appended across runs (default `./rustproxy_mitm.pcap`; `none` disables) |
+| `--mitm-keylog <file>` | Also write TLS secrets in `SSLKEYLOGFILE` format, to decrypt a real `tcpdump` capture of either leg in Wireshark |
+| `--mitm-bypass <hosts>` | Comma-separated host suffixes tunnelled untouched, matched against the SNI — for certificate-pinned apps (e.g. `apple.com,icloud.com`) |
+| `--mitm-insecure` | Don't verify the real server's certificate (self-signed test servers) |
+
+How it behaves:
+
+- **The pcap is synthetic.** Each intercepted connection is written as a clean TCP conversation (raw-IP link type) carrying the plaintext, with the real client and server addresses. Server port 443 is recorded as **80**, because Wireshark binds 443 to its TLS dissector and would not decode already-decrypted bytes as HTTP; other ports are kept as-is.
+- **ALPN is mirrored.** The proxy offers the server whatever the client offered and gives the client what the server picked, so HTTP/2 stays HTTP/2.
+- **Non-TLS tunnels are untouched** and not captured, as are bypassed hosts. A client that sends nothing for 3 seconds (server-speaks-first protocols) is also relayed untouched.
+- **Upstream certificates are verified** against the bundled Mozilla roots; a failure drops the connection rather than vouching for an unverified server.
+- Clients that pin certificates or don't trust the CA fail their handshake; the log says which host so you can add it to `--mitm-bypass`.
+
+> **Security:** `ca.key` can impersonate any site to every client that trusts `ca.crt` — keep it private (it is created mode `0600`) and remove the CA from your trust store when done. The pcap and key log contain passwords, cookies and tokens in clear text. Only intercept traffic you are authorised to inspect.
 
 ## Architecture
 

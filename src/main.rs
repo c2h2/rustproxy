@@ -21,6 +21,9 @@ mod update;
 mod tcp_tune;
 mod rate_limit;
 mod bench;
+mod mitm;
+mod mitm_record;
+mod mitm_web;
 
 #[cfg(test)]
 mod test_utils;
@@ -88,6 +91,35 @@ fn print_usage() {
     println!("                               (e.g. 0.1, 1, 1000). All connections from one");
     println!("                               IP share the limit, up+down combined.");
     println!("                               Default: unlimited.");
+    println!("  --mitm                       TLS interception (http / socks5 modes): decrypt");
+    println!("                               tunnelled TLS with certificates minted from a local");
+    println!("                               CA and write the plaintext to a pcap for Wireshark.");
+    println!("                               Clients must trust <ca-dir>/ca.crt.");
+    println!("  --mitm-ca-dir <dir>          CA certificate/key directory (default: ./rustproxy-ca).");
+    println!("                               Generated only if missing; an existing CA is reused.");
+    println!("  --mitm-regen-ca              Force a new CA even if one exists (old pair is kept");
+    println!("                               as ca.crt.old / ca.key.old; clients must re-trust)");
+    println!("  --http-interface <addr:port>  With --mitm: web interface (e.g. :8889) with");
+    println!("                               /         CA download + iOS / macOS / Windows setup");
+    println!("                               /traffic  record, browse and export HTTP(S) flows:");
+    println!("                                         from/to address, headers, bodies; HAR");
+    println!("                                         export and a zip dump of visited sites");
+    println!("                               /traffic answers only this machine unless");
+    println!("                               --mitm-web-auth is set");
+    println!("  --mitm-web-auth <user:pass>  Login for /traffic, required to open it remotely");
+    println!("  --mitm-store-mb <MiB>        Memory for recorded bodies (default: 256); oldest");
+    println!("                               flows are dropped first");
+    println!("  --mitm-h2                    Keep HTTP/2 on intercepted connections. By default,");
+    println!("                               while the traffic browser is on, connections are");
+    println!("                               steered to HTTP/1.1 so they can be listed there");
+    println!("  --mitm-pcap <file>           Decrypted capture file (default: ./rustproxy_mitm.pcap;");
+    println!("                               'none' disables). Port 443 is recorded as 80 so");
+    println!("                               Wireshark dissects HTTP instead of expecting TLS.");
+    println!("  --mitm-keylog <file>         Also write TLS secrets (SSLKEYLOGFILE format) to");
+    println!("                               decrypt a real tcpdump capture in Wireshark");
+    println!("  --mitm-bypass <hosts>        Comma-separated host suffixes to tunnel untouched");
+    println!("                               (e.g. apple.com,icloud.com for pinned apps)");
+    println!("  --mitm-insecure              Do not verify the real server's certificate");
     println!("  --dns <servers>              Custom DNS resolvers (overrides system DNS).");
     println!("                               Comma-separated list. Each entry may be:");
     println!("                                 8.8.8.8                       (UDP, port 53)");
@@ -142,6 +174,12 @@ fn print_usage() {
     println!("    --target 127.0.0.1:11180,127.0.0.1:11181,127.0.0.1:11190,127.0.0.1:11191 \\");
     println!("    --mode tcp --lb failover --healthcheck --healthcheck-probe socks5 \\");
     println!("    --http-interface 0.0.0.0:62075");
+    println!();
+    println!("HTTPS analysis (decrypted pcap for Wireshark):");
+    println!("  rustproxy --listen 0.0.0.0:8080 --mode http --mitm --http-interface :8889");
+    println!("  # then open http://<proxy-ip>:8889/ on the device to install the CA");
+    println!("  curl --cacert rustproxy-ca/ca.crt -x http://127.0.0.1:8080 https://example.com/");
+    println!("  wireshark rustproxy_mitm.pcap");
     println!();
     println!("Environment Variables:");
     println!("  RUSTPROXY_MANAGER=<addr:port>  Set manager address for stats reporting");
@@ -280,6 +318,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vmess_password = None;
     let mut dns_spec: Option<String> = None;
     let mut dns_cache_size: usize = dns::DEFAULT_CACHE_SIZE;
+    let mut mitm_enabled = false;
+    let mut mitm_ca_dir: Option<String> = None;
+    let mut mitm_pcap: Option<String> = None;
+    let mut mitm_keylog: Option<String> = None;
+    let mut mitm_bypass: Option<String> = None;
+    let mut mitm_insecure = false;
+    let mut mitm_regen_ca = false;
+    let mut mitm_keep_h2 = false;
+    let mut mitm_web_auth: Option<String> = None;
+    let mut mitm_store_mb: Option<String> = None;
     let mut tcp_ka_time: Option<u64> = None;
     let mut tcp_ka_interval: Option<u64> = None;
     let mut tcp_ka_retries: Option<u32> = None;
@@ -434,6 +482,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 2;
                 } else {
                     i += 1;
+                }
+            }
+            "--mitm" => {
+                mitm_enabled = true;
+                i += 1;
+            }
+            "--mitm-h2" => {
+                mitm_keep_h2 = true;
+                i += 1;
+            }
+            "--mitm-regen-ca" => {
+                mitm_regen_ca = true;
+                i += 1;
+            }
+            "--mitm-insecure" => {
+                mitm_insecure = true;
+                i += 1;
+            }
+            "--mitm-ca-dir" | "--mitm-pcap" | "--mitm-keylog" | "--mitm-bypass" | "--mitm-web-auth"
+            | "--mitm-store-mb" => {
+                if i + 1 < args.len() {
+                    let slot = match args[i].as_str() {
+                        "--mitm-ca-dir" => &mut mitm_ca_dir,
+                        "--mitm-pcap" => &mut mitm_pcap,
+                        "--mitm-keylog" => &mut mitm_keylog,
+                        "--mitm-web-auth" => &mut mitm_web_auth,
+                        "--mitm-store-mb" => &mut mitm_store_mb,
+                        _ => &mut mitm_bypass,
+                    };
+                    *slot = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("{} requires a value", args[i]);
+                    std::process::exit(1);
                 }
             }
             "--dns" => {
@@ -667,13 +749,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("--lb is only valid with --mode tcp");
         std::process::exit(1);
     }
-    if mode != "tcp" && http_interface.is_some() {
-        eprintln!("--http-interface is only valid with --mode tcp");
+    if mode != "tcp" && http_interface.is_some() && !mitm_enabled {
+        eprintln!("--http-interface is only valid with --mode tcp, or with --mitm (CA download page)");
         std::process::exit(1);
     }
     if mode != "tcp" && healthcheck_enabled {
         eprintln!("--healthcheck is only valid with --mode tcp");
         std::process::exit(1);
+    }
+
+    // TLS interception only makes sense where the client names its target
+    // (HTTP CONNECT / SOCKS5).
+    let mitm_option_given = mitm_ca_dir.is_some()
+        || mitm_pcap.is_some()
+        || mitm_keylog.is_some()
+        || mitm_bypass.is_some()
+        || mitm_insecure
+        || mitm_regen_ca
+        || mitm_keep_h2
+        || mitm_web_auth.is_some()
+        || mitm_store_mb.is_some();
+    if mitm_option_given && !mitm_enabled {
+        eprintln!("--mitm-* options require --mitm");
+        std::process::exit(1);
+    }
+    if mitm_enabled {
+        if mode != "http" && mode != "socks5" {
+            eprintln!("--mitm is only valid with --mode http or --mode socks5");
+            std::process::exit(1);
+        }
+        let pcap = match mitm_pcap.as_deref() {
+            Some("none") => None,
+            Some(path) => Some(std::path::PathBuf::from(path)),
+            None => Some(std::path::PathBuf::from("./rustproxy_mitm.pcap")),
+        };
+        let store_mb = match mitm_store_mb.as_deref().map(|s| s.parse::<usize>()) {
+            None => 256,
+            Some(Ok(n)) if n > 0 => n,
+            Some(_) => {
+                eprintln!("Invalid --mitm-store-mb: expected a positive number of MiB");
+                std::process::exit(1);
+            }
+        };
+        if let Some(ref auth) = mitm_web_auth {
+            if http_interface.is_none() {
+                eprintln!("--mitm-web-auth requires --http-interface");
+                std::process::exit(1);
+            }
+            if !matches!(auth.split_once(':'), Some((u, p)) if !u.is_empty() && !p.is_empty()) {
+                eprintln!("--mitm-web-auth must be in format 'username:password'");
+                std::process::exit(1);
+            }
+        }
+        let cfg = mitm::MitmConfig {
+            ca_dir: std::path::PathBuf::from(mitm_ca_dir.as_deref().unwrap_or("./rustproxy-ca")),
+            regen_ca: mitm_regen_ca,
+            pcap: pcap.clone(),
+            keylog: mitm_keylog.as_ref().map(std::path::PathBuf::from),
+            insecure: mitm_insecure,
+            bypass: mitm_bypass
+                .as_deref()
+                .map(|s| s.split(',').map(|h| h.to_string()).collect())
+                .unwrap_or_default(),
+            // Flows are only kept when there is an interface to browse them.
+            record: http_interface.is_some(),
+            store_mb,
+            keep_h2: mitm_keep_h2,
+        };
+        if let Err(e) = mitm::init(cfg) {
+            eprintln!("Error enabling --mitm: {}", e);
+            std::process::exit(1);
+        }
+        warn!("TLS interception ENABLED: tunnelled TLS is decrypted by this proxy");
+        match pcap {
+            Some(p) => info!("mitm: decrypted traffic -> {} (contains credentials/cookies in clear text)", p.display()),
+            None => info!("mitm: pcap capture disabled"),
+        }
+        if let (Some(iface), Some(m)) = (http_interface.as_ref(), mitm::global()) {
+            let web_bind = normalize_bind_addr(iface);
+            let state = Arc::new(mitm_web::MitmWebState {
+                mitm: m,
+                mode: mode.clone(),
+                proxy_listen: listen.clone(),
+                web_listen: web_bind.clone(),
+                auth: mitm_web_auth.clone(),
+            });
+            if mitm_web_auth.is_none() {
+                info!("mitm: traffic browser is limited to this machine (set --mitm-web-auth user:pass for remote access)");
+            }
+            tokio::spawn(mitm_web::start(web_bind, state));
+        }
+        if mitm_insecure {
+            warn!("mitm: upstream certificate verification is DISABLED (--mitm-insecure)");
+        }
     }
 
     // Validate no self-connection for tcp mode (single target only)

@@ -20,6 +20,10 @@ fn content_length_of(headers: &hyper::HeaderMap) -> u64 {
         .unwrap_or(0)
 }
 
+fn path_of(uri: &hyper::Uri) -> &str {
+    uri.path_and_query().map(|x| x.as_str()).unwrap_or("/")
+}
+
 fn build_client() -> Client<HttpConnector<HyperResolver>> {
     let mut connector = HttpConnector::new_with_resolver(HyperResolver);
     connector.enforce_http(false);
@@ -182,8 +186,13 @@ async fn proxy_handler_with_stats(
                                 // Client leg is hyper::Upgraded (not TcpStream), so
                                 // we cannot apply OS keepalive to it; hyper server
                                 // already set nodelay on the accept socket.
-                                let (from_client, from_server, e_c2s, e_s2c) =
-                                    crate::tcp_proxy::run_pumps(upgraded, server, 0, Some(client_addr.ip())).await;
+                                // With --mitm, TLS inside the tunnel is terminated
+                                // and re-encrypted; non-TLS falls back to the same
+                                // run_pumps relay.
+                                let (from_client, from_server, e_c2s, e_s2c) = match crate::mitm::global() {
+                                    Some(mitm) => mitm.relay(upgraded, client_addr, &authority, server, 0).await,
+                                    None => crate::tcp_proxy::run_pumps(upgraded, server, 0, Some(client_addr.ip())).await,
+                                };
                                 if let Some(e) = e_c2s {
                                     debug!("CONNECT client->server {}: {}", authority, e);
                                 }
@@ -240,8 +249,46 @@ async fn proxy_handler_with_stats(
             // that direction rather than materializing multi‑GB payloads in RAM.
             let request_size = content_length_of(req.headers());
 
+            // Traffic browser (--mitm + --http-interface): list plain-HTTP
+            // requests too. Bodies are copied as they stream; a body that is
+            // already complete is left untouched so hyper keeps its framing.
+            let recorder = crate::mitm::global().and_then(|m| m.recorder());
+            let flow = recorder.as_ref().and_then(|rec| {
+                use crate::mitm_record::{addr_string, hyper_headers, ConnMeta};
+                let meta = ConnMeta {
+                    client: addr_string(client_addr),
+                    server: target_host.clone(),
+                    scheme: "http",
+                    default_host: target_host.clone(),
+                };
+                rec.begin(&meta, req.method().as_str(), path_of(req.uri()), "HTTP/1.1", hyper_headers(req.headers()))
+            });
+            if let (Some(rec), Some(flow)) = (&recorder, &flow) {
+                use hyper::body::HttpBody;
+                if !req.body().is_end_stream() {
+                    let body = std::mem::take(req.body_mut());
+                    *req.body_mut() = crate::mitm_record::RecordedBody::wrap(body, rec.clone(), flow.clone(), false);
+                }
+            }
+
             match client.request(req).await {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    if let (Some(rec), Some(flow)) = (&recorder, &flow) {
+                        use hyper::body::HttpBody;
+                        rec.set_response(
+                            flow,
+                            resp.status().as_u16(),
+                            resp.status().canonical_reason().unwrap_or(""),
+                            "HTTP/1.1",
+                            crate::mitm_record::hyper_headers(resp.headers()),
+                        );
+                        if resp.body().is_end_stream() {
+                            rec.finish(flow, "done");
+                        } else {
+                            let body = std::mem::take(resp.body_mut());
+                            *resp.body_mut() = crate::mitm_record::RecordedBody::wrap(body, rec.clone(), flow.clone(), true);
+                        }
+                    }
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
                         let response_size = content_length_of(resp.headers());
                         stats
@@ -253,6 +300,9 @@ async fn proxy_handler_with_stats(
                 }
                 Err(e) => {
                     error!("Error proxying request: {}", e);
+                    if let (Some(rec), Some(flow)) = (&recorder, &flow) {
+                        rec.finish(flow, "aborted");
+                    }
                     if let (Some(ref stats), Some(ref conn_id)) = (&stats, &conn_id) {
                         stats.close_connection(conn_id).await;
                     }

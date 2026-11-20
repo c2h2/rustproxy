@@ -16,6 +16,9 @@ pub mod update;
 pub mod tcp_tune;
 pub mod rate_limit;
 pub mod bench;
+pub mod mitm;
+pub mod mitm_record;
+pub mod mitm_web;
 
 #[cfg(test)]
 pub mod test_utils;

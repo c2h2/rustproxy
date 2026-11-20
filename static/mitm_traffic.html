@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RustProxy traffic</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #5b6270;
+    --line: #dfe3ea; --accent: #0b7a4b; --accent-text: #ffffff; --row: #eef6f1;
+    --sel: #d5ecdf; --code: #f0f2f6; --ok: #0b7a4b; --redir: #8a6100; --err: #b3261e; --pend: #5b6270;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101319; --panel: #181c24; --text: #e8eaef; --muted: #9aa3b2;
+      --line: #2a303b; --accent: #34c98a; --accent-text: #06261a; --row: #1c2420;
+      --sel: #1f3a2d; --code: #222834; --ok: #34c98a; --redir: #e0b252; --err: #ff8078; --pend: #9aa3b2;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .mono, td, pre, .kv { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  button, a.btn, input[type=search] {
+    font: inherit; padding: 6px 11px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); text-decoration: none; cursor: pointer;
+  }
+  button:hover, a.btn:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button.paused { background: var(--err); border-color: var(--err); color: #fff; }
+  input[type=search] { cursor: text; flex: 1 1 220px; min-width: 160px; }
+  .spacer { flex: 1 1 0; }
+  #stats { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 0; }
+  main.nosel { grid-template-columns: minmax(0, 1fr); }
+  main.nosel #detail { display: none; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); grid-template-rows: 45% 55%; } }
+  #list { overflow: auto; min-height: 0; }
+  table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+  th {
+    position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 600;
+    font: 600 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--muted); padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  td.num { text-align: right; }
+  tr.flow { cursor: pointer; }
+  tr.flow:hover { background: var(--row); }
+  tr.flow.sel { background: var(--sel); }
+  .s2 { color: var(--ok); } .s3 { color: var(--redir); } .s4, .s5, .aborted { color: var(--err); } .pending { color: var(--pend); }
+  col.c-id { width: 48px; } col.c-time { width: 118px; } col.c-method { width: 68px; } col.c-status { width: 60px; }
+  col.c-host { width: 19%; } col.c-type { width: 132px; } col.c-size { width: 78px; } col.c-ms { width: 74px; } col.c-addr { width: 27%; }
+  /* With the detail pane open the list is half as wide: keep what identifies
+     a request and leave type and addresses to the pane. */
+  main:not(.nosel) col.c-type, main:not(.nosel) col.c-addr { display: none; }
+  main:not(.nosel) th:nth-child(7), main:not(.nosel) td:nth-child(7),
+  main:not(.nosel) th:nth-child(10), main:not(.nosel) td:nth-child(10) { display: none; }
+  main:not(.nosel) col.c-host { width: 30%; }
+  #empty { padding: 40px 20px; text-align: center; color: var(--muted); }
+  #detail { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #detail .top { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  #d-url { word-break: break-all; font-weight: 600; }
+  #d-route { color: var(--muted); margin-top: 3px; word-break: break-all; }
+  .tabs { display: flex; gap: 2px; padding: 0 10px; border-bottom: 1px solid var(--line); }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 10px; color: var(--muted); }
+  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .tabs .close { margin-left: auto; }
+  #d-body { flex: 1; overflow: auto; padding: 12px 14px; min-height: 0; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 14px 0 6px; }
+  h3:first-child { margin-top: 0; }
+  .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { word-break: break-all; }
+  pre { background: var(--code); padding: 10px; border-radius: 7px; margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .bodybar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; color: var(--muted); }
+  img.preview { max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: repeating-conic-gradient(#8882 0 25%, transparent 0 50%) 0 0/16px 16px; }
+  .note { color: var(--muted); }
+</style>
+</head>
+<body>
+{{TOPBAR}}
+<header>
+  <button id="rec" class="primary" title="Pause or resume recording">● Recording</button>
+  <button id="clear" title="Discard every recorded flow">Clear</button>
+  <input id="filter" type="search" placeholder="Filter: host, path, method or status" autocomplete="off">
+  <a class="btn" id="x-har" title="HTTP Archive of the listed flows — opens in browser dev tools and most HTTP tools">Export HAR</a>
+  <a class="btn" id="x-zip" title="Zip of fetched page content, laid out as host/path">Dump sites (.zip)</a>
+  <a class="btn" id="x-pcap" href="/export/pcap" download title="Decrypted packet capture for Wireshark">pcap</a>
+  <span id="stats"></span>
+</header>
+<main class="nosel">
+  <div id="list">
+    <table>
+      <colgroup>
+        <col class="c-id"><col class="c-time"><col class="c-method"><col class="c-status"><col class="c-host">
+        <col><col class="c-type"><col class="c-size"><col class="c-ms"><col class="c-addr">
+      </colgroup>
+      <thead><tr>
+        <th>#</th><th>Time</th><th>Method</th><th>Status</th><th>Host</th>
+        <th>Path</th><th>Type</th><th>Size</th><th>Took</th><th>From → To</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty">No traffic recorded yet. Send requests through the proxy and they will appear here.</div>
+  </div>
+  <section id="detail">
+    <div class="top">
+      <div id="d-url" class="mono"></div>
+      <div id="d-route" class="mono"></div>
+    </div>
+    <div class="tabs">
+      <button data-tab="headers" class="on">Headers</button>
+      <button data-tab="request">Request body</button>
+      <button data-tab="response">Response body</button>
+      <button class="close" id="d-close" title="Close">✕</button>
+    </div>
+    <div id="d-body"></div>
+  </section>
+</main>
+<script>
+(function () {
+  'use strict';
+  var flows = new Map(), rowEls = new Map();
+  var since = 0, epoch = null, selected = null, tab = 'headers', detail = null, recording = true;
+  var $ = function (id) { return document.getElementById(id); };
+  // Deep link: /traffic#flow=12&tab=response opens that flow.
+  var hash = new URLSearchParams(location.hash.slice(1));
+  var wanted = hash.get('flow') ? Number(hash.get('flow')) : null;
+  if (['headers', 'request', 'response'].indexOf(hash.get('tab')) >= 0) tab = hash.get('tab');
+  var rows = $('rows'), filterEl = $('filter');
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function size(n) {
+    if (n == null) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+  function clock(ms) {
+    var d = new Date(ms), p = function (n, w) { return String(n).padStart(w || 2, '0'); };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+  }
+  function haystack(f) {
+    return (f.method + ' ' + f.scheme + '://' + f.host + f.path + ' ' + (f.status || '')).toLowerCase();
+  }
+  function statusClass(f) {
+    if (f.state === 'aborted') return 'aborted';
+    if (!f.status) return 'pending';
+    return 's' + String(f.status)[0];
+  }
+  function statusText(f) {
+    if (f.status) return String(f.status);
+    return f.state === 'aborted' ? 'failed' : '…';
+  }
+
+  function paintRow(f) {
+    var tr = rowEls.get(f.id);
+    if (!tr) {
+      tr = el('tr', 'flow');
+      tr.dataset.id = f.id;
+      for (var i = 0; i < 10; i++) tr.appendChild(el('td'));
+      rowEls.set(f.id, tr);
+      rows.appendChild(tr);
+    }
+    var c = tr.children;
+    c[0].textContent = f.id;
+    c[1].textContent = clock(f.t);
+    c[2].textContent = f.method;
+    c[3].textContent = statusText(f);
+    c[3].className = statusClass(f);
+    c[4].textContent = f.host; c[4].title = f.host;
+    c[5].textContent = f.path; c[5].title = f.scheme + '://' + f.host + f.path;
+    c[6].textContent = f.type;
+    c[7].textContent = f.status ? size(f.resp_size) : ''; c[7].className = 'num';
+    c[8].textContent = f.ms == null ? '' : f.ms + ' ms'; c[8].className = 'num';
+    c[9].textContent = f.client + ' → ' + f.server; c[9].title = c[9].textContent;
+    tr.hidden = !haystack(f).includes(filterEl.value.trim().toLowerCase());
+    tr.classList.toggle('sel', f.id === selected);
+  }
+
+  function applyFilter() {
+    var q = filterEl.value.trim().toLowerCase(), shown = 0;
+    flows.forEach(function (f) {
+      var tr = rowEls.get(f.id);
+      tr.hidden = !haystack(f).includes(q);
+      if (!tr.hidden) shown++;
+    });
+    var qs = q ? '?q=' + encodeURIComponent(q) : '';
+    $('x-har').href = '/export/har' + qs;
+    $('x-zip').href = '/export/site.zip' + qs;
+    return shown;
+  }
+
+  function reset() {
+    flows.clear(); rowEls.clear(); rows.textContent = ''; since = 0;
+    select(null);
+  }
+
+  function poll() {
+    fetch('/api/flows?since=' + since).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      if (epoch !== null && d.epoch !== epoch) reset();
+      epoch = d.epoch;
+      var list = $('list');
+      var atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+      d.flows.sort(function (a, b) { return a.id - b.id; }).forEach(function (f) {
+        flows.set(f.id, f);
+        paintRow(f);
+        if (f.id === selected && detail && detail.rev !== f.rev) loadDetail();
+      });
+      flows.forEach(function (f, id) {          // dropped by the server to fit its memory budget
+        if (id < d.first_id) { rowEls.get(id).remove(); rowEls.delete(id); flows.delete(id); }
+      });
+      since = d.rev;
+      recording = d.recording;
+      var rec = $('rec');
+      rec.textContent = recording ? '● Recording' : '❚❚ Paused';
+      rec.className = recording ? 'primary' : 'paused';
+      var shown = applyFilter();
+      $('stats').textContent = (shown === flows.size ? flows.size : shown + ' of ' + flows.size) +
+        ' flows · ' + size(d.stored_bytes) + ' of ' + size(d.max_bytes) + ' stored';
+      $('empty').hidden = flows.size > 0;
+      if (atBottom && d.flows.length) list.scrollTop = list.scrollHeight;
+      if (wanted !== null && flows.has(wanted)) { var w = wanted; wanted = null; select(w); }
+    }).catch(function (e) {
+      $('stats').textContent = 'Disconnected (' + e.message + ')';
+    }).finally(function () { setTimeout(poll, 1000); });
+  }
+
+  function select(id) {
+    if (selected !== null && rowEls.get(selected)) rowEls.get(selected).classList.remove('sel');
+    selected = id; detail = null;
+    history.replaceState(null, '', id === null ? location.pathname : '#flow=' + id + '&tab=' + tab);
+    document.querySelector('main').classList.toggle('nosel', id === null);
+    if (id === null) return;
+    rowEls.get(id).classList.add('sel');
+    loadDetail();
+  }
+
+  function loadDetail() {
+    var id = selected;
+    fetch('/api/flows/' + id).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+      if (id !== selected) return;
+      if (!d) { select(null); return; }
+      detail = d;
+      $('d-url').textContent = d.method + ' ' + d.url;
+      $('d-route').textContent = d.client + '  →  ' + d.server;
+      renderTab();
+    });
+  }
+
+  function kv(pairs) {
+    var box = el('div', 'kv');
+    pairs.forEach(function (p) { box.appendChild(el('div', 'k', p[0])); box.appendChild(el('div', 'v', p[1])); });
+    return box;
+  }
+
+  function renderTab() {
+    var body = $('d-body'), d = detail;
+    document.querySelectorAll('.tabs button[data-tab]').forEach(function (b) {
+      b.classList.toggle('on', b.dataset.tab === tab);
+    });
+    body.textContent = '';
+    if (!d) return;
+    if (tab === 'headers') {
+      body.appendChild(el('h3', '', 'General'));
+      body.appendChild(kv([
+        ['URL', d.url],
+        ['Method', d.method + ' (' + d.req_version + ')'],
+        ['Status', d.status ? d.status + ' ' + d.reason + ' (' + d.resp_version + ')' : d.state],
+        ['From', d.client],
+        ['To', d.server],
+        ['Started', new Date(d.t).toLocaleString() + ' (' + clock(d.t) + ')'],
+        ['Duration', d.ms == null ? 'in progress' : d.ms + ' ms'],
+        ['Sizes', size(d.req_size) + ' sent, ' + size(d.resp_size) + ' received (body bytes on the wire)'],
+        ['State', d.state]
+      ]));
+      body.appendChild(el('h3', '', 'Request headers'));
+      body.appendChild(kv(d.req_headers));
+      body.appendChild(el('h3', '', 'Response headers'));
+      body.appendChild(d.resp_headers.length ? kv(d.resp_headers) : el('div', 'note', 'No response yet.'));
+      return;
+    }
+    renderBody(body, d, tab);
+  }
+
+  var TEXT = /^(text\/|application\/(json|javascript|x-javascript|xml|x-www-form-urlencoded|graphql|ld\+json|manifest\+json|xhtml\+xml)|image\/svg\+xml)/i;
+  var IMAGE = /^image\/(png|jpeg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)/i;
+  var SHOW = 1024 * 1024;
+
+  function headerOf(list, name) {
+    for (var i = 0; i < list.length; i++) if (list[i][0].toLowerCase() === name) return list[i][1];
+    return '';
+  }
+
+  function hexdump(bytes) {
+    var out = [], n = Math.min(bytes.length, 4096);
+    for (var o = 0; o < n; o += 16) {
+      var hex = '', asc = '';
+      for (var i = 0; i < 16; i++) {
+        if (o + i < n) {
+          var b = bytes[o + i];
+          hex += b.toString(16).padStart(2, '0') + ' ';
+          asc += b >= 32 && b < 127 ? String.fromCharCode(b) : '.';
+        } else hex += '   ';
+        if (i === 7) hex += ' ';
+      }
+      out.push(o.toString(16).padStart(6, '0') + '  ' + hex + ' ' + asc);
+    }
+    if (bytes.length > n) out.push('… ' + (bytes.length - n) + ' more bytes (download for the rest)');
+    return out.join('\n');
+  }
+
+  function renderBody(body, d, side) {
+    var isResp = side === 'response';
+    var total = isResp ? d.resp_size : d.req_size, stored = isResp ? d.resp_stored : d.req_stored;
+    var enc = isResp ? d.resp_encoding : d.req_encoding;
+    var ctype = headerOf(isResp ? d.resp_headers : d.req_headers, 'content-type');
+    var base = '/api/flows/' + d.id + '/' + side;
+    if (!stored) {
+      body.appendChild(el('div', 'note', total ? 'Body was not kept (' + size(total) + ', dropped to fit the memory budget).' : 'No body.'));
+      return;
+    }
+    var bar = el('div', 'bodybar');
+    bar.appendChild(el('span', '', (ctype || 'unknown type') + ' · ' + size(total) + (enc ? ' (' + enc + ' on the wire)' : '')));
+    var dl = el('a', 'btn', 'Download'); dl.href = base + '?download=1'; bar.appendChild(dl);
+    if (enc) { var raw = el('a', 'btn', 'Download as sent'); raw.href = base + '?raw=1&download=1'; bar.appendChild(raw); }
+    body.appendChild(bar);
+    if (stored < total) body.appendChild(el('div', 'note', 'Only the first ' + size(stored) + ' of this body was kept.'));
+
+    var id = d.id, rev = d.rev;
+    fetch(base).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+      if (!detail || detail.id !== id || detail.rev !== rev || tab !== side) return;
+      var bytes = new Uint8Array(buf);
+      if (IMAGE.test(ctype)) {
+        var img = el('img', 'preview');
+        img.src = URL.createObjectURL(new Blob([bytes], { type: ctype.split(';')[0].trim() }));
+        img.onload = function () { URL.revokeObjectURL(img.src); };
+        body.appendChild(img);
+        return;
+      }
+      var text = null;
+      try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, SHOW)); }
+      catch (e) { if (TEXT.test(ctype)) text = new TextDecoder('utf-8').decode(bytes.subarray(0, SHOW)); }
+      if (text === null) { body.appendChild(el('pre', '', hexdump(bytes))); return; }
+      if (/json/i.test(ctype) && bytes.length <= SHOW) {
+        try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* show as sent */ }
+      }
+      body.appendChild(el('pre', '', text));
+      if (bytes.length > SHOW) body.appendChild(el('div', 'note', 'Showing the first ' + size(SHOW) + '; download for the rest.'));
+    });
+  }
+
+  rows.addEventListener('click', function (e) {
+    var tr = e.target.closest('tr.flow');
+    if (tr) select(Number(tr.dataset.id));
+  });
+  document.querySelector('.tabs').addEventListener('click', function (e) {
+    if (e.target.dataset.tab) {
+      tab = e.target.dataset.tab;
+      if (selected !== null) history.replaceState(null, '', '#flow=' + selected + '&tab=' + tab);
+      renderTab();
+    }
+  });
+  $('d-close').addEventListener('click', function () { select(null); });
+  filterEl.addEventListener('input', applyFilter);
+  $('rec').addEventListener('click', function () {
+    fetch('/api/recording?on=' + (recording ? 0 : 1), { method: 'POST' });
+  });
+  $('clear').addEventListener('click', function () {
+    if (confirm('Discard all ' + flows.size + ' recorded flows?')) fetch('/api/clear', { method: 'POST' });
+  });
+  fetch('/export/pcap', { method: 'HEAD' }).then(function (r) { if (!r.ok) $('x-pcap').hidden = true; });
+  applyFilter();
+  poll();
+})();
+</script>
+</body>
+</html>
